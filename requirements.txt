@@ -1,6 +1,7 @@
 discord.py[voice]
 Flask
-yt-dlp
+yt-dlp[default]
+yt-dlp-ejs
 imageio-ffmpeg
 spotipy
 PyNaCl
