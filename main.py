@@ -1,842 +1,3726 @@
+# ============================================================
+# Discord Music + Moderation + Self Role + Welcome System
+# Single-file main.py
+#
+# Environment Variables:
+#   DISCORD_TOKEN
+#   SPOTIFY_CLIENT_ID
+#   SPOTIFY_CLIENT_SECRET
+#
+# Dependencies:
+#   discord.py[voice]
+#   Flask
+#   yt-dlp
+#   imageio-ffmpeg
+#   spotipy
+#   PyNaCl
+#   davey
+# ============================================================
+
 import os
 import re
-import json
-import sqlite3
 import asyncio
-import datetime
+import logging
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from threading import Thread
+from typing import Optional
+from urllib.parse import urlparse
 
-from flask import Flask
 import discord
 from discord import app_commands
+from discord.ext import commands
+
 import yt_dlp
-import imageio_ffmpeg
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
-# =========================================================
-# DATABASE SETUP (SQLite)
-# =========================================================
+from flask import Flask, jsonify
 
-DB_NAME = "bot_config.db"
+import imageio_ffmpeg
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # Table for Welcome/Goodbye/Boost Configs
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS server_configs (
-            guild_id INTEGER PRIMARY KEY,
-            welcome_channel_id INTEGER,
-            welcome_msg TEXT,
-            welcome_img TEXT,
-            welcome_enabled INTEGER DEFAULT 0,
-            goodbye_channel_id INTEGER,
-            goodbye_msg TEXT,
-            goodbye_img TEXT,
-            goodbye_enabled INTEGER DEFAULT 0,
-            boost_channel_id INTEGER,
-            boost_msg TEXT,
-            boost_img TEXT,
-            boost_enabled INTEGER DEFAULT 0
-        )
-    ''')
-    # Table for Warnings
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER,
-            user_id INTEGER,
-            reason TEXT,
-            moderator_id INTEGER,
-            timestamp TEXT
-        )
-    ''')
-    # Table for Persistent Self Role Panels
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS self_roles (
-            message_id INTEGER PRIMARY KEY,
-            guild_id INTEGER,
-            channel_id INTEGER,
-            title TEXT,
-            description TEXT,
-            image_url TEXT,
-            roles_json TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
-init_db()
+# ============================================================
+# CONFIG
+# ============================================================
 
-def db_execute(query, params=()):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(query, params)
-    conn.commit()
-    conn.close()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-def db_fetch_one(query, params=()):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(query, params)
-    res = c.fetchone()
-    conn.close()
-    return res
-
-def db_fetch_all(query, params=()):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(query, params)
-    res = c.fetchall()
-    conn.close()
-    return res
-
-# =========================================================
-# CONFIG & ENVIRONMENT VARIABLES
-# =========================================================
-
-TOKEN = os.getenv("DISCORD_TOKEN")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
-# =========================================================
-# FLASK WEB SERVER (FOR RENDER KEEP ALIVE)
-# =========================================================
+DATABASE_FILE = "bot_data.sqlite3"
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("ไม่พบ Environment Variable: DISCORD_TOKEN")
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger("DiscordBot")
+
+
+# ============================================================
+# TIMEZONE
+# ============================================================
+
+UTC = timezone.utc
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+db_lock = asyncio.Lock()
+
+
+def get_db():
+    conn = sqlite3.connect(
+        DATABASE_FILE,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database():
+    conn = get_db()
+    cur = conn.cursor()
+
+    # --------------------------------------------------------
+    # Guild settings
+    # --------------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id INTEGER PRIMARY KEY,
+
+            welcome_enabled INTEGER DEFAULT 0,
+            welcome_channel_id INTEGER,
+            welcome_message TEXT,
+            welcome_image TEXT,
+            welcome_embed INTEGER DEFAULT 1,
+
+            goodbye_enabled INTEGER DEFAULT 0,
+            goodbye_channel_id INTEGER,
+            goodbye_message TEXT,
+            goodbye_image TEXT,
+            goodbye_embed INTEGER DEFAULT 1,
+
+            boost_enabled INTEGER DEFAULT 0,
+            boost_channel_id INTEGER,
+            boost_message TEXT,
+            boost_image TEXT,
+            boost_embed INTEGER DEFAULT 1
+        )
+    """)
+
+    # --------------------------------------------------------
+    # Self roles
+    # --------------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS role_panels (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            image_url TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS self_roles (
+            guild_id INTEGER NOT NULL,
+            role_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            emoji TEXT,
+            custom_id TEXT NOT NULL UNIQUE,
+            PRIMARY KEY (guild_id, role_id)
+        )
+    """)
+
+    # --------------------------------------------------------
+    # Warnings
+    # --------------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            moderator_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+    logger.info("SQLite database initialized")
+
+
+init_database()
+
+
+# ============================================================
+# SQLITE HELPERS
+# ============================================================
+
+def ensure_guild_settings(guild_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT guild_id FROM guild_settings WHERE guild_id = ?",
+        (guild_id,)
+    )
+
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO guild_settings (guild_id) VALUES (?)",
+            (guild_id,)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_guild_settings(guild_id: int):
+    ensure_guild_settings(guild_id)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM guild_settings WHERE guild_id = ?",
+        (guild_id,)
+    )
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row
+
+
+# ============================================================
+# FLASK WEB SERVER
+# ============================================================
 
 app = Flask(__name__)
 
+
 @app.route("/")
-def home():
-    return "LOMIRA Multi-System Bot is Running Online!"
+def index():
+    return jsonify({
+        "status": "online",
+        "service": "Discord Bot"
+    })
+
 
 @app.route("/health")
 def health():
-    return "OK", 200
+    return jsonify({
+        "status": "healthy"
+    })
 
-def run_web():
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-def keep_alive():
-    t = Thread(target=run_web, daemon=True)
-    t.start()
+def run_web_server():
+    port = int(os.getenv("PORT", "10000"))
 
-# =========================================================
-# SPOTIFY & YOUTUBE / FFMPEG SETUP
-# =========================================================
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
 
-sp = None
+
+# Start Flask
+Thread(
+    target=run_web_server,
+    daemon=True
+).start()
+
+
+# ============================================================
+# SPOTIFY
+# ============================================================
+
+spotify_client = None
+
 if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
     try:
-        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-            client_id=SPOTIFY_CLIENT_ID,
-            client_secret=SPOTIFY_CLIENT_SECRET
-        ))
-        print("[SPOTIFY] Successfully Connected!")
-    except Exception as e:
-        print(f"[SPOTIFY ERROR] {e}")
-
-try:
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception as e:
-    ffmpeg_path = "ffmpeg"
-
-YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'ytsearch1',
-    'source_address': '0.0.0.0',
-    'nocheckcertificate': True,
-    'geo_bypass': True,
-    'socket_timeout': 15,
-}
-
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
-
-def get_spotify_track_info(url_or_query: str):
-    match = re.search(r"open\.spotify\.com/track/([a-zA-Z0-9]+)", url_or_query)
-    if match and sp:
-        try:
-            track = sp.track(match.group(1))
-            name = track.get("name", "")
-            artists = ", ".join([a["name"] for a in track.get("artists", [])])
-            return f"{name} {artists}"
-        except Exception as e:
-            print(f"[SPOTIFY FETCH ERROR] {e}")
-    return url_or_query
-
-async def search_yt(query: str):
-    loop = asyncio.get_running_loop()
-    def _extract():
-        query_term = get_spotify_track_info(query)
-        target = query_term if query_term.startswith("http") else f"ytsearch1:{query_term}"
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            try:
-                info = ydl.extract_info(target, download=False)
-                if 'entries' in info and len(info['entries']) > 0:
-                    info = info['entries'][0]
-                return {
-                    'title': info.get('title', 'Unknown Title'),
-                    'url': info.get('url'),
-                    'duration': info.get('duration', 0),
-                    'webpage_url': info.get('webpage_url', '')
-                }
-            except Exception as e:
-                print(f"[YT-DLP SEARCH ERROR] {e}")
-                return None
-    return await loop.run_in_executor(None, _extract)
-
-# =========================================================
-# MUSIC SYSTEM DATA STRUCTURES
-# =========================================================
-
-music_queues = {}
-now_playing = {}
-loop_status = {}
-volume_status = {}
-
-def get_queue(guild_id: int):
-    if guild_id not in music_queues:
-        music_queues[guild_id] = []
-    return music_queues[guild_id]
-
-def format_sec(sec):
-    if not sec: return "Live / ไม่ทราบเวลา"
-    m, s = divmod(int(sec), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
-
-# =========================================================
-# PERSISTENT SELF ROLE VIEWS & BUTTONS
-# =========================================================
-
-class SelfRoleButton(discord.ui.Button):
-    def __init__(self, role_id: int, label: str):
-        super().__init__(
-            label=label,
-            style=discord.ButtonStyle.primary,
-            custom_id=f"persistent_role_{role_id}"
+        spotify_client = spotipy.Spotify(
+            auth_manager=SpotifyClientCredentials(
+                client_id=SPOTIFY_CLIENT_ID,
+                client_secret=SPOTIFY_CLIENT_SECRET
+            )
         )
-        self.role_id = role_id
 
-    async def callback(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if not guild:
-            return await interaction.response.send_message("❌ คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์", ephemeral=True)
-        
-        role = guild.get_role(self.role_id)
-        if not role:
-            return await interaction.response.send_message("❌ ไม่พบยศนี้ในเซิร์ฟเวอร์", ephemeral=True)
-        
-        bot_member = guild.me
-        if bot_member.top_role <= role:
-            return await interaction.response.send_message("❌ บอทไม่มีสิทธิ์จัดการยศนี้ (ยศนี้อยู่สูงกว่าหรือเท่ากับยศของบอท)", ephemeral=True)
+        logger.info("Spotify API initialized")
 
-        user = interaction.user
-        try:
-            if role in user.roles:
-                await user.remove_roles(role)
-                await interaction.response.send_message(f"➖ ถอดยศ **{role.name}** เรียบร้อยแล้ว", ephemeral=True)
-            else:
-                await user.add_roles(role)
-                await interaction.response.send_message(f"➕ รับยศ **{role.name}** เรียบร้อยแล้ว", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ บอทไม่มีสิทธิ์จัดการยศ (ขาด Manage Roles)", ephemeral=True)
+    except Exception as e:
+        logger.error("Spotify initialization failed: %s", e)
+        spotify_client = None
+else:
+    logger.warning(
+        "Spotify credentials not found. "
+        "Spotify URL playback will be unavailable."
+    )
 
-class DynamicSelfRoleView(discord.ui.View):
-    def __init__(self, roles_data):
-        super().__init__(timeout=None)
-        for role_id, role_name in roles_data:
-            self.add_item(SelfRoleButton(int(role_id), role_name))
 
-# =========================================================
-# DISCORD CLIENT CLASS
-# =========================================================
+# ============================================================
+# DISCORD INTENTS
+# ============================================================
 
 intents = discord.Intents.default()
-intents.message_content = True
+
+intents.guilds = True
 intents.members = True
 intents.voice_states = True
+intents.message_content = True
 
-class LomiraBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+
+# ============================================================
+# BOT
+# ============================================================
+
+class MusicBot(commands.Bot):
 
     async def setup_hook(self):
-        # Register Persistent Views for Self Roles from Database
-        rows = db_fetch_all("SELECT roles_json FROM self_roles")
-        for row in rows:
-            try:
-                roles_data = json.loads(row[0])
-                self.add_view(DynamicSelfRoleView(roles_data))
-            except Exception as e:
-                print(f"[RELOAD VIEW ERROR] {e}")
 
-        # Set Activity
-        activity = discord.Activity(type=discord.ActivityType.listening, name="/play")
-        await self.change_presence(activity=activity)
+        logger.info("Loading persistent role panels...")
 
-        print("[BOT SETUP] Registering & Syncing Slash Commands...")
-        synced = await self.tree.sync()
-        print(f"[BOT SETUP] Synced {len(synced)} Slash Commands successfully!")
+        await load_persistent_role_views()
 
-client = LomiraBot()
+        logger.info("Syncing Slash Commands...")
 
-@client.event
-async def on_ready():
-    print("=" * 60)
-    print(f"🤖 Bot Online as: {client.user} (ID: {client.user.id})")
-    print(f"🌐 Connected Servers: {len(client.guilds)}")
-    print(f"🎵 Activity set to: Listening to /play")
-    print("=" * 60)
+        try:
+            synced = await self.tree.sync()
 
-# =========================================================
-# GLOBAL ERROR HANDLER FOR SLASH COMMANDS
-# =========================================================
+            logger.info(
+                "Slash Commands Sync สำเร็จ: %d commands",
+                len(synced)
+            )
 
-@client.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ คุณไม่มีสิทธิ์ (Permission) ในการใช้คำสั่งนี้"
-    elif isinstance(error, app_commands.BotMissingPermissions):
-        msg = "❌ บอทขาดสิทธิ์ (Bot Permission) ในการทำงานตามคำสั่งนี้"
-    elif isinstance(error, app_commands.NoPrivateMessage):
-        msg = "❌ คำสั่งนี้สามารถใช้งานในเซิร์ฟเวอร์เท่านั้น"
-    else:
-        msg = f"❌ เกิดข้อผิดพลาด: {str(error)}"
-    
+        except Exception as e:
+            logger.exception(
+                "Slash Commands Sync failed: %s",
+                e
+            )
+
+
+bot = MusicBot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# ============================================================
+# MUSIC DATA
+# ============================================================
+
+@dataclass
+class Song:
+    title: str
+    url: str
+    webpage_url: str
+    duration: int
+    thumbnail: Optional[str]
+    requester_id: int
+    source: str
+
+
+@dataclass
+class GuildMusic:
+    queue: list
+    current: Optional[Song]
+    voice_client: Optional[discord.VoiceClient]
+    loop: bool
+    volume: float
+    lock: asyncio.Lock
+
+
+music_sessions: dict[int, GuildMusic] = {}
+
+
+def get_music_session(guild_id: int) -> GuildMusic:
+
+    if guild_id not in music_sessions:
+        music_sessions[guild_id] = GuildMusic(
+            queue=[],
+            current=None,
+            voice_client=None,
+            loop=False,
+            volume=1.0,
+            lock=asyncio.Lock()
+        )
+
+    return music_sessions[guild_id]
+
+
+# ============================================================
+# YT-DLP CONFIG
+# ============================================================
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+YTDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "source_address": "0.0.0.0",
+    "cachedir": False,
+}
+
+YTDL_SEARCH_OPTIONS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "source_address": "0.0.0.0",
+    "cachedir": False,
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def format_duration(seconds: Optional[int]) -> str:
+
+    if not seconds:
+        return "ไม่ทราบ"
+
+    seconds = int(seconds)
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+
+    return f"{minutes}:{secs:02d}"
+
+
+def is_url(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^https?://",
+            text,
+            re.IGNORECASE
+        )
+    )
+
+
+def is_spotify_url(text: str) -> bool:
+
+    parsed = urlparse(text)
+
+    return (
+        parsed.netloc.lower() in {
+            "open.spotify.com",
+            "spotify.com"
+        }
+        and "/track/" in parsed.path
+    )
+
+
+def extract_spotify_track_id(url: str) -> Optional[str]:
+
+    match = re.search(
+        r"/track/([A-Za-z0-9]+)",
+        url
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def replace_variables(
+    text: str,
+    member: discord.Member
+) -> str:
+
+    guild = member.guild
+
+    replacements = {
+        "{user}": member.mention,
+        "{username}": member.name,
+        "{server}": guild.name,
+        "{member_count}": str(guild.member_count or 0),
+    }
+
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+
+    return text
+
+
+def safe_text(text: Optional[str]) -> str:
+    return text if text else ""
+
+
+# ============================================================
+# SPOTIFY -> YOUTUBE
+# ============================================================
+
+async def spotify_to_youtube(
+    spotify_url: str
+) -> Optional[str]:
+
+    if not spotify_client:
+        raise RuntimeError(
+            "ยังไม่ได้ตั้งค่า SPOTIFY_CLIENT_ID / "
+            "SPOTIFY_CLIENT_SECRET"
+        )
+
+    track_id = extract_spotify_track_id(spotify_url)
+
+    if not track_id:
+        raise ValueError("Spotify URL ไม่ใช่ Track URL ที่ถูกต้อง")
+
+    def fetch_spotify():
+
+        return spotify_client.track(track_id)
+
+    track = await asyncio.to_thread(
+        fetch_spotify
+    )
+
+    if not track:
+        return None
+
+    title = track.get("name")
+
+    artists = track.get("artists", [])
+
+    artist_names = ", ".join(
+        artist.get("name", "")
+        for artist in artists
+    )
+
+    if not title:
+        return None
+
+    search_query = f"{title} {artist_names}"
+
+    return search_query
+
+
+# ============================================================
+# YOUTUBE SEARCH / EXTRACTION
+# ============================================================
+
+async def extract_youtube_song(
+    query: str,
+    requester_id: int,
+    source_name: str = "YouTube"
+) -> Song:
+
+    def extract():
+
+        with yt_dlp.YoutubeDL(
+            YTDL_SEARCH_OPTIONS
+        ) as ydl:
+
+            if is_url(query):
+
+                info = ydl.extract_info(
+                    query,
+                    download=False
+                )
+
+            else:
+
+                info = ydl.extract_info(
+                    f"ytsearch1:{query}",
+                    download=False
+                )
+
+            if not info:
+                raise RuntimeError(
+                    "ไม่พบข้อมูลเพลง"
+                )
+
+            if "entries" in info:
+
+                entries = info.get("entries")
+
+                if not entries:
+                    raise RuntimeError(
+                        "ไม่พบเพลงจากการค้นหา"
+                    )
+
+                info = entries[0]
+
+            if not info:
+                raise RuntimeError(
+                    "ไม่พบข้อมูลเพลง"
+                )
+
+            stream_url = info.get("url")
+
+            if not stream_url:
+
+                formats = info.get(
+                    "formats",
+                    []
+                )
+
+                audio_formats = [
+                    f for f in formats
+                    if f.get("acodec") != "none"
+                    and f.get("url")
+                ]
+
+                if audio_formats:
+
+                    audio_formats.sort(
+                        key=lambda x: (
+                            x.get("abr") or 0
+                        ),
+                        reverse=True
+                    )
+
+                    stream_url = audio_formats[0].get(
+                        "url"
+                    )
+
+            if not stream_url:
+                raise RuntimeError(
+                    "ไม่สามารถหา Audio Stream ของเพลงได้"
+                )
+
+            return Song(
+                title=info.get(
+                    "title",
+                    "Unknown"
+                ),
+                url=stream_url,
+                webpage_url=info.get(
+                    "webpage_url",
+                    query
+                ),
+                duration=info.get(
+                    "duration",
+                    0
+                ) or 0,
+                thumbnail=info.get(
+                    "thumbnail"
+                ),
+                requester_id=requester_id,
+                source=source_name
+            )
+
+    return await asyncio.to_thread(extract)
+
+
+async def resolve_song(
+    query: str,
+    requester_id: int
+) -> Song:
+
+    query = query.strip()
+
+    if not query:
+        raise ValueError(
+            "กรุณาระบุชื่อเพลงหรือ URL"
+        )
+
+    # Spotify
+    if is_spotify_url(query):
+
+        spotify_query = await spotify_to_youtube(
+            query
+        )
+
+        if not spotify_query:
+            raise RuntimeError(
+                "ไม่สามารถอ่านข้อมูลเพลงจาก Spotify ได้"
+            )
+
+        return await extract_youtube_song(
+            spotify_query,
+            requester_id,
+            "Spotify → YouTube"
+        )
+
+    # YouTube URL
+    if is_url(query):
+
+        if (
+            "youtube.com" in query.lower()
+            or "youtu.be" in query.lower()
+        ):
+
+            return await extract_youtube_song(
+                query,
+                requester_id,
+                "YouTube"
+            )
+
+        raise ValueError(
+            "รองรับ URL ของ YouTube หรือ Spotify เท่านั้น"
+        )
+
+    # Search
+    return await extract_youtube_song(
+        query,
+        requester_id,
+        "YouTube Search"
+    )
+
+
+# ============================================================
+# VOICE CONNECTION
+# ============================================================
+
+async def ensure_voice(
+    interaction: discord.Interaction
+) -> discord.VoiceClient:
+
+    if not interaction.guild:
+        raise RuntimeError(
+            "คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์"
+        )
+
+    member = interaction.guild.get_member(
+        interaction.user.id
+    )
+
+    if not member:
+        raise RuntimeError(
+            "ไม่พบข้อมูลสมาชิกของคุณในเซิร์ฟเวอร์"
+        )
+
+    if not member.voice or not member.voice.channel:
+        raise RuntimeError(
+            "คุณต้องอยู่ใน Voice Channel ก่อน"
+        )
+
+    target_channel = member.voice.channel
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    voice_client = interaction.guild.voice_client
+
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
+
+        if voice_client:
+
+            if voice_client.channel.id != target_channel.id:
+
+                await voice_client.move_to(
+                    target_channel
+                )
+
+            session.voice_client = voice_client
+
+            return voice_client
+
+        voice_client = await target_channel.connect(
+            self_deaf=True
+        )
+
+        session.voice_client = voice_client
+
+        return voice_client
+
+    except discord.ClientException as e:
+
+        raise RuntimeError(
+            f"ไม่สามารถเข้า Voice Channel ได้: {e}"
+        )
+
+
+# ============================================================
+# PLAYBACK
+# ============================================================
+
+async def play_next(guild: discord.Guild):
+
+    session = get_music_session(
+        guild.id
+    )
+
+    async with session.lock:
+
+        voice_client = guild.voice_client
+
+        if not voice_client:
+            session.current = None
+            session.voice_client = None
+            return
+
+        if not voice_client.is_connected():
+            session.current = None
+            session.voice_client = None
+            return
+
+        # Loop current song
+        if session.loop and session.current:
+
+            song = session.current
+
         else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    except Exception:
-        pass
 
-# =========================================================
-# MUSIC PLAYBACK LOGIC
-# =========================================================
+            if not session.queue:
 
-async def play_next(guild: discord.Guild, text_channel: discord.TextChannel):
-    guild_id = guild.id
-    vc = guild.voice_client
+                session.current = None
 
-    if not vc or not vc.is_connected():
+                if voice_client.is_playing():
+                    voice_client.stop()
+
+                return
+
+            song = session.queue.pop(0)
+
+            session.current = song
+
+        try:
+
+            # Refresh stream URL before playing.
+            refreshed = await extract_youtube_song(
+                song.webpage_url,
+                song.requester_id,
+                song.source
+            )
+
+            song.url = refreshed.url
+
+        except Exception as e:
+
+            logger.error(
+                "Failed to refresh audio stream: %s",
+                e
+            )
+
+            session.current = None
+
+            await play_next(guild)
+
+            return
+
+        ffmpeg_options = {
+            "before_options": (
+                "-reconnect 1 "
+                "-reconnect_streamed 1 "
+                "-reconnect_delay_max 5"
+            ),
+            "options": (
+                "-vn "
+                "-loglevel warning"
+            )
+        }
+
+        try:
+
+            source = discord.FFmpegPCMAudio(
+                song.url,
+                executable=FFMPEG_PATH,
+                **ffmpeg_options
+            )
+
+            volume_source = discord.PCMVolumeTransformer(
+                source,
+                volume=session.volume
+            )
+
+            def after_play(error):
+
+                if error:
+                    logger.error(
+                        "Audio playback error: %s",
+                        error
+                    )
+
+                future = asyncio.run_coroutine_threadsafe(
+                    playback_finished(guild),
+                    bot.loop
+                )
+
+                try:
+                    future.result()
+                except Exception as callback_error:
+                    logger.error(
+                        "Playback callback error: %s",
+                        callback_error
+                    )
+
+            voice_client.play(
+                volume_source,
+                after=after_play
+            )
+
+            logger.info(
+                "Playing in %s: %s",
+                guild.name,
+                song.title
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "FFmpeg playback failed: %s",
+                e
+            )
+
+            session.current = None
+
+            if session.queue:
+                await play_next(guild)
+
+
+async def playback_finished(
+    guild: discord.Guild
+):
+
+    await asyncio.sleep(0.5)
+
+    session = get_music_session(
+        guild.id
+    )
+
+    if not guild.voice_client:
+        session.current = None
         return
 
-    q = get_queue(guild_id)
+    if session.loop:
+        await play_next(guild)
+        return
 
-    # Check loop logic
-    if loop_status.get(guild_id, False) and guild_id in now_playing:
-        current = now_playing[guild_id]
+    if session.queue:
+
+        await play_next(guild)
+
     else:
-        if len(q) == 0:
-            now_playing.pop(guild_id, None)
-            return
-        current = q.pop(0)
-        now_playing[guild_id] = current
 
-    try:
-        vol = volume_status.get(guild_id, 1.0)
-        source = discord.FFmpegPCMAudio(current['url'], executable=ffmpeg_path, **FFMPEG_OPTIONS)
-        transformed_source = discord.PCMVolumeTransformer(source, volume=vol)
+        session.current = None
 
-        def after_finish(err):
-            if err:
-                print(f"[AUDIO ERROR] {err}")
-            fut = play_next(guild, text_channel)
-            asyncio.run_coroutine_threadsafe(fut, client.loop)
-
-        vc.play(transformed_source, after=after_finish)
-        
-        embed = discord.Embed(
-            title="🎵 กำลังเล่นเพลง",
-            description=f"[{current['title']}]({current['webpage_url']})",
-            color=discord.Color.blue()
+        logger.info(
+            "Queue finished in %s",
+            guild.name
         )
-        embed.add_field(name="⏱️ ความยาว", value=format_sec(current['duration']), inline=True)
-        embed.add_field(name="🔁 วนซ้ำ", value="เปิดอยู่" if loop_status.get(guild_id) else "ปิดอยู่", inline=True)
-        await text_channel.send(embed=embed)
 
-    except Exception as e:
-        print(f"[PLAYBACK ERROR] {e}")
-        await text_channel.send(f"❌ เกิดข้อผิดพลาดขณะเล่นเพลง: {e}")
-        await play_next(guild, text_channel)
 
-# =========================================================
-# MUSIC SLASH COMMANDS
-# =========================================================
+# ============================================================
+# EMBEDS
+# ============================================================
 
-@client.tree.command(name="play", description="เล่นเพลงจาก YouTube, Spotify หรือค้นหาชื่อเพลง")
-@app_commands.describe(query="ลิงก์ YouTube, ลิงก์ Spotify หรือชื่อเพลงที่ต้องการค้นหา")
-async def play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.followup.send("❌ คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์")
-
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        return await interaction.followup.send("❌ คุณต้องเชื่อมต่อในห้องเสียง (Voice Channel) ก่อน")
-
-    target_channel = interaction.user.voice.channel
-    vc = interaction.guild.voice_client
-
-    # Connect or Move Voice Channel
-    try:
-        if not vc:
-            vc = await target_channel.connect(self_deaf=True)
-        elif vc.channel != target_channel:
-            await vc.move_to(target_channel)
-    except Exception as e:
-        return await interaction.followup.send(f"❌ ไม่สามารถเข้าห้องเสียงได้: {e}")
-
-    song_info = await search_yt(query)
-    if not song_info or not song_info.get("url"):
-        return await interaction.followup.send("❌ ไม่พบเพลงหรือไม่สามารถดึงข้อมูลเพลงได้ ลองตรวจสอบลิงก์หรือคำค้นหา")
-
-    q = get_queue(interaction.guild.id)
-    
-    if vc.is_playing() or vc.is_paused():
-        q.append(song_info)
-        embed = discord.Embed(
-            title="🎶 เพิ่มเพลงลงคิวแล้ว",
-            description=f"[{song_info['title']}]({song_info['webpage_url']})",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="⏱️ ความยาว", value=format_sec(song_info['duration']))
-        embed.add_field(name="📋 คิวที่", value=str(len(q)))
-        await interaction.followup.send(embed=embed)
-    else:
-        q.append(song_info)
-        await interaction.followup.send("🔎 กำลังเตรียมเล่นเพลง...")
-        await play_next(interaction.guild, interaction.channel)
-
-@client.tree.command(name="queue", description="ดูรายการคิวเพลงที่รอเล่น")
-async def queue_cmd(interaction: discord.Interaction):
-    q = get_queue(interaction.guild.id)
-    curr = now_playing.get(interaction.guild.id)
-
-    if not curr and len(q) == 0:
-        return await interaction.response.send_message("📭 ไม่มีเพลงอยู่ในคิวขณะนี้", ephemeral=True)
-
-    desc = ""
-    if curr:
-        desc += f"**▶️ กำลังเล่นปัจจุบัน:**\n[{curr['title']}]({curr['webpage_url']}) | `{format_sec(curr['duration'])}`\n\n**📋 รายการคิวถัดไป:**\n"
-    
-    if len(q) == 0:
-        desc += "ไม่มีเพลงถัดไปในคิว"
-    else:
-        for idx, s in enumerate(q[:10], start=1):
-            desc += f"`{idx}.` [{s['title']}]({s['webpage_url']}) | `{format_sec(s['duration'])}`\n"
-        if len(q) > 10:
-            desc += f"\n...และอีก {len(q) - 10} เพลง"
-
-    embed = discord.Embed(title=f"🎶 คิวเพลงใน {interaction.guild.name}", description=desc, color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed)
-
-@client.tree.command(name="skip", description="ข้ามเพลงที่กำลังเล่นอยู่")
-async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if not vc or not vc.is_playing():
-        return await interaction.response.send_message("❌ ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
-
-    loop_status[interaction.guild.id] = False
-    vc.stop()
-    await interaction.response.send_message("⏭️ ข้ามเพลงเรียบร้อยแล้ว")
-
-@client.tree.command(name="pause", description="หยุดเล่นเพลงชั่วคราว")
-async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if not vc or not vc.is_playing():
-        return await interaction.response.send_message("❌ ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
-    vc.pause()
-    await interaction.response.send_message("⏸️ หยุดเพลงชั่วคราวแล้ว")
-
-@client.tree.command(name="resume", description="เล่นเพลงต่อจากที่หยุดชั่วคราว")
-async def resume(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if not vc or not vc.is_paused():
-        return await interaction.response.send_message("❌ เพลงไม่ได้ถูกหยุดชั่วคราว", ephemeral=True)
-    vc.resume()
-    await interaction.response.send_message("▶️ เล่นเพลงต่อแล้ว")
-
-@client.tree.command(name="stop", description="หยุดเล่นเพลงและล้างคิวทั้งหมด")
-async def stop(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    get_queue(guild_id).clear()
-    now_playing.pop(guild_id, None)
-    loop_status[guild_id] = False
-
-    vc = interaction.guild.voice_client
-    if vc:
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-    await interaction.response.send_message("⏹️ หยุดเพลงและล้างคิวทั้งหมดเรียบร้อยแล้ว")
-
-@client.tree.command(name="leave", description="ตัดการเชื่อมต่อและออกจากห้องเสียง")
-async def leave(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    get_queue(guild_id).clear()
-    now_playing.pop(guild_id, None)
-    loop_status[guild_id] = False
-
-    vc = interaction.guild.voice_client
-    if vc:
-        await vc.disconnect()
-        await interaction.response.send_message("👋 ออกจากห้องเสียงเรียบร้อยแล้ว")
-    else:
-        await interaction.response.send_message("❌ บอทไม่ได้อยู่ในห้องเสียง", ephemeral=True)
-
-@client.tree.command(name="nowplaying", description="ดูข้อมูลเพลงที่กำลังเล่นอยู่ขณะนี้")
-async def nowplaying(interaction: discord.Interaction):
-    curr = now_playing.get(interaction.guild.id)
-    if not curr:
-        return await interaction.response.send_message("❌ ไม่มีเพลงที่กำลังเล่นอยู่ขณะนี้", ephemeral=True)
+def song_embed(
+    song: Song,
+    title: str = "🎵 เพลง"
+) -> discord.Embed:
 
     embed = discord.Embed(
-        title="🎧 กำลังเล่นเพลง",
-        description=f"[{curr['title']}]({curr['webpage_url']})",
-        color=discord.Color.purple()
+        title=title,
+        description=f"**[{song.title}]({song.webpage_url})**",
+        color=discord.Color.blurple()
     )
-    embed.add_field(name="⏱️ ความยาว", value=format_sec(curr['duration']))
-    embed.add_field(name="🔁 วนซ้ำ", value="เปิด" if loop_status.get(interaction.guild.id) else "ปิด")
-    await interaction.response.send_message(embed=embed)
 
-@client.tree.command(name="loop", description="เปิดหรือปิดการวนซ้ำเพลงเดิม")
-async def loop_cmd(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    status = not loop_status.get(guild_id, False)
-    loop_status[guild_id] = status
-    msg = "🔁 เปิดการวนซ้ำเพลงเดิมเรียบร้อย" if status else "➡️ ปิดการวนซ้ำเพลงแล้ว"
-    await interaction.response.send_message(msg)
+    embed.add_field(
+        name="⏱️ ระยะเวลา",
+        value=format_duration(song.duration),
+        inline=True
+    )
 
-@client.tree.command(name="volume", description="ปรับระดับเสียงของบอท (0 - 100%)")
-@app_commands.describe(level="ระดับเสียง 0 ถึง 100")
-async def volume(interaction: discord.Interaction, level: int):
-    if level < 0 or level > 100:
-        return await interaction.response.send_message("❌ กรุณากำหนดระดับเสียงระหว่าง 0 ถึง 100", ephemeral=True)
-    
-    vol_float = level / 100.0
-    volume_status[interaction.guild.id] = vol_float
-    
-    vc = interaction.guild.voice_client
-    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = vol_float
+    embed.add_field(
+        name="👤 ขอโดย",
+        value=f"<@{song.requester_id}>",
+        inline=True
+    )
 
-    await interaction.response.send_message(f"🔊 ปรับระดับเสียงเป็น **{level}%** เรียบร้อยแล้ว")
+    embed.add_field(
+        name="🔊 แหล่งเพลง",
+        value=song.source,
+        inline=True
+    )
 
-# =========================================================
-# SELF ROLE COMMANDS
-# =========================================================
+    if song.thumbnail:
+        embed.set_thumbnail(
+            url=song.thumbnail
+        )
 
-@client.tree.command(name="setup_roles", description="สร้างแผงปุ่มรับยศแบบ Embed")
-@app_commands.describe(
-    title="หัวข้อของแผงรับยศ",
-    description="คำอธิบายแผงรับยศ",
-    image_url="URL ของรูปภาพหรือ GIF ประกอบ (ไม่ใส่ก็ได้)"
+    return embed
+
+
+# ============================================================
+# /play
+# ============================================================
+
+@bot.tree.command(
+    name="play",
+    description="เล่นเพลงจาก YouTube, Spotify หรือชื่อเพลง"
 )
-@app_commands.checks.has_permissions(manage_roles=True)
-async def setup_roles(interaction: discord.Interaction, title: str, description: str, image_url: str = None):
+@app_commands.guild_only()
+@app_commands.describe(
+    query="ลิงก์ YouTube/Spotify หรือชื่อเพลง"
+)
+async def play(
+    interaction: discord.Interaction,
+    query: str
+):
+
     await interaction.response.defer()
 
-    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
-    if image_url:
-        embed.set_image(url=image_url)
+    if not interaction.guild:
+        await interaction.followup.send(
+            "❌ คำสั่งนี้ใช้ในเซิร์ฟเวอร์เท่านั้น"
+        )
+        return
 
-    empty_view = discord.ui.View()
-    msg = await interaction.followup.send(embed=embed, view=empty_view)
+    try:
 
-    db_execute(
-        "INSERT INTO self_roles (message_id, guild_id, channel_id, title, description, image_url, roles_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (msg.id, interaction.guild.id, interaction.channel.id, title, description, image_url or "", "[]")
+        voice_client = await ensure_voice(
+            interaction
+        )
+
+    except Exception as e:
+
+        await interaction.followup.send(
+            f"❌ {e}"
+        )
+        return
+
+    try:
+
+        song = await resolve_song(
+            query,
+            interaction.user.id
+        )
+
+    except yt_dlp.DownloadError as e:
+
+        logger.error(
+            "yt-dlp error: %s",
+            e
+        )
+
+        await interaction.followup.send(
+            "❌ ไม่สามารถโหลดเพลงจาก YouTube ได้"
+        )
+
+        return
+
+    except Exception as e:
+
+        logger.error(
+            "Song resolve error: %s",
+            e
+        )
+
+        await interaction.followup.send(
+            f"❌ ไม่พบเพลงหรือไม่สามารถโหลดเพลงได้\n`{e}`"
+        )
+
+        return
+
+    session = get_music_session(
+        interaction.guild.id
     )
 
-@client.tree.command(name="add_role", description="เพิ่มยศลงในแผงรับยศที่มีอยู่")
-@app_commands.describe(message_id="ID ของข้อความแผงรับยศ", role="ยศที่ต้องการเพิ่มลงแผง")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def add_role(interaction: discord.Interaction, message_id: str, role: discord.Role):
-    await interaction.response.defer()
+    async with session.lock:
+
+        if voice_client.is_playing() or voice_client.is_paused():
+
+            session.queue.append(song)
+
+            position = len(session.queue)
+
+            await interaction.followup.send(
+                embed=song_embed(
+                    song,
+                    "➕ เพิ่มเพลงเข้าคิว"
+                )
+            )
+
+            await interaction.followup.send(
+                f"📋 ตำแหน่งในคิว: **#{position}**"
+            )
+
+            return
+
+        session.current = song
+
+        # Put current back temporarily so play_next
+        # can use the same playback logic.
+        if voice_client.is_playing():
+            voice_client.stop()
+
+    # Directly play the current song
     try:
-        msg_id = int(message_id)
-    except ValueError:
-        return await interaction.followup.send("❌ Message ID ไม่ถูกต้อง")
 
-    row = db_fetch_one("SELECT title, description, image_url, roles_json, channel_id FROM self_roles WHERE message_id = ?", (msg_id,))
-    if not row:
-        return await interaction.followup.send("❌ ไม่พบแผงรับยศจาก Message ID นี้ในระบบ")
+        ffmpeg_options = {
+            "before_options": (
+                "-reconnect 1 "
+                "-reconnect_streamed 1 "
+                "-reconnect_delay_max 5"
+            ),
+            "options": "-vn -loglevel warning"
+        }
 
-    title, description, image_url, roles_json, channel_id = row
-    roles_data = json.loads(roles_json)
+        source = discord.FFmpegPCMAudio(
+            song.url,
+            executable=FFMPEG_PATH,
+            **ffmpeg_options
+        )
 
-    if any(r[0] == str(role.id) for r in roles_data):
-        return await interaction.followup.send("❌ ยศนี้มีอยู่ในแผงรับยศแล้ว")
+        volume_source = discord.PCMVolumeTransformer(
+            source,
+            volume=session.volume
+        )
 
-    roles_data.append((str(role.id), role.name))
-    new_roles_json = json.dumps(roles_data)
+        def after_play(error):
 
-    db_execute("UPDATE self_roles SET roles_json = ? WHERE message_id = ?", (new_roles_json, msg_id))
+            if error:
+                logger.error(
+                    "Playback error: %s",
+                    error
+                )
 
-    channel = interaction.guild.get_channel(channel_id)
-    if channel:
-        try:
-            target_msg = await channel.fetch_message(msg_id)
-            view = DynamicSelfRoleView(roles_data)
-            await target_msg.edit(view=view)
-            client.add_view(view)
-        except Exception as e:
-            return await interaction.followup.send(f"⚠️ บันทึกข้อมูลแล้ว แต่ไม่สามารถแก้ไขข้อความแผงรับยศได้: {e}")
+            future = asyncio.run_coroutine_threadsafe(
+                playback_finished(
+                    interaction.guild
+                ),
+                bot.loop
+            )
 
-    await interaction.followup.send(f"✅ เพิ่มยศ **{role.name}** เข้าแผงรับยศเรียบร้อยแล้ว")
+            try:
+                future.result()
+            except Exception:
+                pass
 
-@client.tree.command(name="remove_role", description="ลบยศออกจากแผงรับยศ")
-@app_commands.describe(message_id="ID ของข้อความแผงรับยศ", role="ยศที่ต้องการลบออกจากแผง")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def remove_role(interaction: discord.Interaction, message_id: str, role: discord.Role):
-    await interaction.response.defer()
+        voice_client.play(
+            volume_source,
+            after=after_play
+        )
+
+        await interaction.followup.send(
+            embed=song_embed(
+                song,
+                "▶️ กำลังเล่น"
+            )
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "FFmpeg error: %s",
+            e
+        )
+
+        session.current = None
+
+        await interaction.followup.send(
+            "❌ FFmpeg ไม่สามารถเล่นเพลงนี้ได้"
+        )
+
+
+# ============================================================
+# /queue
+# ============================================================
+
+@bot.tree.command(
+    name="queue",
+    description="ดูเพลงที่กำลังรอเล่นในคิว"
+)
+@app_commands.guild_only()
+async def queue_command(
+    interaction: discord.Interaction
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    embed = discord.Embed(
+        title="📋 Music Queue",
+        color=discord.Color.blurple()
+    )
+
+    if session.current:
+
+        embed.add_field(
+            name="▶️ กำลังเล่น",
+            value=(
+                f"**[{session.current.title}]"
+                f"({session.current.webpage_url})**"
+            ),
+            inline=False
+        )
+
+    if not session.queue:
+
+        embed.add_field(
+            name="Queue",
+            value="ไม่มีเพลงรออยู่",
+            inline=False
+        )
+
+    else:
+
+        lines = []
+
+        for index, song in enumerate(
+            session.queue[:20],
+            start=1
+        ):
+
+            lines.append(
+                f"`{index}.` "
+                f"[{song.title}]({song.webpage_url})"
+            )
+
+        if len(session.queue) > 20:
+            lines.append(
+                f"\n... และอีก "
+                f"{len(session.queue) - 20} เพลง"
+            )
+
+        embed.add_field(
+            name="เพลงที่รอ",
+            value="\n".join(lines),
+            inline=False
+        )
+
+    embed.set_footer(
+        text=f"จำนวนในคิว: {len(session.queue)}"
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /skip
+# ============================================================
+
+@bot.tree.command(
+    name="skip",
+    description="ข้ามเพลงที่กำลังเล่น"
+)
+@app_commands.guild_only()
+async def skip(
+    interaction: discord.Interaction
+):
+
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client or not voice_client.is_connected():
+        await interaction.response.send_message(
+            "❌ บอทไม่ได้อยู่ในห้องเสียง"
+        )
+        return
+
+    if not voice_client.is_playing():
+        await interaction.response.send_message(
+            "❌ ไม่มีเพลงที่กำลังเล่น"
+        )
+        return
+
+    voice_client.stop()
+
+    await interaction.response.send_message(
+        "⏭️ ข้ามเพลงแล้ว"
+    )
+
+
+# ============================================================
+# /pause
+# ============================================================
+
+@bot.tree.command(
+    name="pause",
+    description="หยุดเพลงชั่วคราว"
+)
+@app_commands.guild_only()
+async def pause(
+    interaction: discord.Interaction
+):
+
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client or not voice_client.is_playing():
+        await interaction.response.send_message(
+            "❌ ไม่มีเพลงที่กำลังเล่น"
+        )
+        return
+
+    voice_client.pause()
+
+    await interaction.response.send_message(
+        "⏸️ หยุดเพลงชั่วคราวแล้ว"
+    )
+
+
+# ============================================================
+# /resume
+# ============================================================
+
+@bot.tree.command(
+    name="resume",
+    description="เล่นเพลงต่อจากที่หยุดไว้"
+)
+@app_commands.guild_only()
+async def resume(
+    interaction: discord.Interaction
+):
+
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client or not voice_client.is_paused():
+        await interaction.response.send_message(
+            "❌ ไม่มีเพลงที่หยุดชั่วคราว"
+        )
+        return
+
+    voice_client.resume()
+
+    await interaction.response.send_message(
+        "▶️ เล่นเพลงต่อแล้ว"
+    )
+
+
+# ============================================================
+# /stop
+# ============================================================
+
+@bot.tree.command(
+    name="stop",
+    description="หยุดเพลงและล้างคิว"
+)
+@app_commands.guild_only()
+async def stop(
+    interaction: discord.Interaction
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    session.queue.clear()
+    session.current = None
+
+    voice_client = interaction.guild.voice_client
+
+    if voice_client and (
+        voice_client.is_playing()
+        or voice_client.is_paused()
+    ):
+        voice_client.stop()
+
+    await interaction.response.send_message(
+        "⏹️ หยุดเพลงและล้างคิวแล้ว"
+    )
+
+
+# ============================================================
+# /leave
+# ============================================================
+
+@bot.tree.command(
+    name="leave",
+    description="ให้บอทออกจากห้องเสียง"
+)
+@app_commands.guild_only()
+async def leave(
+    interaction: discord.Interaction
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    session.queue.clear()
+    session.current = None
+
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client:
+        await interaction.response.send_message(
+            "❌ บอทไม่ได้อยู่ในห้องเสียง"
+        )
+        return
+
+    await voice_client.disconnect()
+
+    session.voice_client = None
+
+    await interaction.response.send_message(
+        "👋 ออกจากห้องเสียงแล้ว"
+    )
+
+
+# ============================================================
+# /nowplaying
+# ============================================================
+
+@bot.tree.command(
+    name="nowplaying",
+    description="แสดงเพลงที่กำลังเล่น"
+)
+@app_commands.guild_only()
+async def nowplaying(
+    interaction: discord.Interaction
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    if not session.current:
+
+        await interaction.response.send_message(
+            "❌ ไม่มีเพลงที่กำลังเล่น"
+        )
+        return
+
+    embed = song_embed(
+        session.current,
+        "🎧 Now Playing"
+    )
+
+    embed.add_field(
+        name="🔁 Loop",
+        value="เปิด" if session.loop else "ปิด",
+        inline=True
+    )
+
+    embed.add_field(
+        name="🔊 Volume",
+        value=f"{int(session.volume * 100)}%",
+        inline=True
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /loop
+# ============================================================
+
+@bot.tree.command(
+    name="loop",
+    description="เปิดหรือปิดการวนเพลง"
+)
+@app_commands.guild_only()
+async def loop_command(
+    interaction: discord.Interaction
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    session.loop = not session.loop
+
+    await interaction.response.send_message(
+        f"🔁 Loop: **{'เปิด' if session.loop else 'ปิด'}**"
+    )
+
+
+# ============================================================
+# /volume
+# ============================================================
+
+@bot.tree.command(
+    name="volume",
+    description="ปรับระดับเสียงเพลง"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    percent="ระดับเสียง 0-100"
+)
+async def volume(
+    interaction: discord.Interaction,
+    percent: app_commands.Range[int, 0, 100]
+):
+
+    session = get_music_session(
+        interaction.guild.id
+    )
+
+    session.volume = percent / 100
+
+    voice_client = interaction.guild.voice_client
+
+    if voice_client and voice_client.source:
+
+        source = voice_client.source
+
+        if isinstance(
+            source,
+            discord.PCMVolumeTransformer
+        ):
+            source.volume = session.volume
+
+    await interaction.response.send_message(
+        f"🔊 ตั้งเสียงเป็น **{percent}%**"
+    )
+
+
+# ============================================================
+# PERMISSION HELPERS
+# ============================================================
+
+def has_permission(
+    interaction: discord.Interaction,
+    permission: str
+) -> bool:
+
+    if not interaction.guild:
+        return False
+
+    member = interaction.guild.get_member(
+        interaction.user.id
+    )
+
+    if not member:
+        return False
+
+    permissions = member.guild_permissions
+
+    if permissions.administrator:
+        return True
+
+    return getattr(
+        permissions,
+        permission,
+        False
+    )
+
+
+def bot_has_permission(
+    guild: discord.Guild,
+    permission: str
+) -> bool:
+
+    me = guild.me
+
+    if not me:
+        return False
+
+    if me.guild_permissions.administrator:
+        return True
+
+    return getattr(
+        me.guild_permissions,
+        permission,
+        False
+    )
+
+
+async def permission_error(
+    interaction: discord.Interaction,
+    permission_name: str
+):
+
+    message = (
+        f"❌ คุณไม่มี Permission สำหรับคำสั่งนี้\n"
+        f"ต้องมี: **{permission_name}**"
+    )
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
+            ephemeral=True
+        )
+
+
+# ============================================================
+# ROLE HIERARCHY
+# ============================================================
+
+def bot_can_manage_role(
+    guild: discord.Guild,
+    role: discord.Role
+) -> bool:
+
+    me = guild.me
+
+    if not me:
+        return False
+
+    if role.is_default():
+        return False
+
+    return role < me.top_role
+
+
+def member_target_valid(
+    guild: discord.Guild,
+    target: discord.Member
+) -> bool:
+
+    me = guild.me
+
+    if not me:
+        return False
+
+    return target != me and target.top_role < me.top_role
+
+
+# ============================================================
+# /setup_roles
+# ============================================================
+
+@bot.tree.command(
+    name="setup_roles",
+    description="สร้างแผงปุ่มสำหรับรับยศ"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="ห้องที่จะส่งแผงรับยศ",
+    title="ชื่อแผงรับยศ",
+    description="คำอธิบายแผงรับยศ",
+    image_url="URL รูปภาพหรือ GIF"
+)
+async def setup_roles(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    description: str,
+    image_url: Optional[str] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_roles"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Roles"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "manage_roles"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Manage Roles`",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=title[:256],
+        description=description[:4096],
+        color=discord.Color.blurple()
+    )
+
+    if image_url:
+        embed.set_image(
+            url=image_url
+        )
+
+    view = SelfRoleView(
+        interaction.guild.id
+    )
+
     try:
-        msg_id = int(message_id)
-    except ValueError:
-        return await interaction.followup.send("❌ Message ID ไม่ถูกต้อง")
 
-    row = db_fetch_one("SELECT roles_json, channel_id FROM self_roles WHERE message_id = ?", (msg_id,))
-    if not row:
-        return await interaction.followup.send("❌ ไม่พบแผงรับยศจาก Message ID นี้ในระบบ")
+        message = await channel.send(
+            embed=embed,
+            view=view
+        )
 
-    roles_json, channel_id = row
-    roles_data = json.loads(roles_json)
-    
-    new_roles_data = [r for r in roles_data if r[0] != str(role.id)]
-    if len(new_roles_data) == len(roles_data):
-        return await interaction.followup.send("❌ ไม่พบยศนี้ในแผงรับยศ")
+    except discord.Forbidden:
 
-    new_roles_json = json.dumps(new_roles_data)
-    db_execute("UPDATE self_roles SET roles_json = ? WHERE message_id = ?", (new_roles_json, msg_id))
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์ส่งข้อความในห้องนี้",
+            ephemeral=True
+        )
+        return
 
-    channel = interaction.guild.get_channel(channel_id)
-    if channel:
+    except discord.HTTPException:
+
+        await interaction.response.send_message(
+            "❌ Discord API ไม่สามารถส่งแผงรับยศได้",
+            ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO role_panels
+        (
+            guild_id,
+            channel_id,
+            message_id,
+            title,
+            description,
+            image_url
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            interaction.guild.id,
+            channel.id,
+            message.id,
+            title,
+            description,
+            image_url
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    bot.add_view(
+        view,
+        message_id=message.id
+    )
+
+    await interaction.response.send_message(
+        f"✅ สร้างแผงรับยศที่ {channel.mention} แล้ว",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# SELF ROLE VIEW
+# ============================================================
+
+class RoleButton(
+    discord.ui.Button
+):
+
+    def __init__(
+        self,
+        guild_id: int,
+        role_id: int,
+        label: str,
+        emoji: Optional[str],
+        custom_id: str
+    ):
+
+        super().__init__(
+            label=label[:80],
+            emoji=emoji,
+            style=discord.ButtonStyle.primary,
+            custom_id=custom_id
+        )
+
+        self.guild_id = guild_id
+        self.role_id = role_id
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        guild = interaction.guild
+
+        if not guild:
+
+            await interaction.response.send_message(
+                "❌ คำสั่งนี้ใช้ในเซิร์ฟเวอร์เท่านั้น",
+                ephemeral=True
+            )
+            return
+
+        role = guild.get_role(
+            self.role_id
+        )
+
+        if not role:
+
+            await interaction.response.send_message(
+                "❌ ไม่พบยศนี้แล้ว",
+                ephemeral=True
+            )
+            return
+
+        if not bot_has_permission(
+            guild,
+            "manage_roles"
+        ):
+
+            await interaction.response.send_message(
+                "❌ บอทไม่มี Permission `Manage Roles`",
+                ephemeral=True
+            )
+            return
+
+        if not bot_can_manage_role(
+            guild,
+            role
+        ):
+
+            await interaction.response.send_message(
+                "❌ บอทไม่สามารถจัดการยศนี้ได้ "
+                "เพราะยศอยู่สูงกว่าหรือเท่ากับยศสูงสุดของบอท",
+                ephemeral=True
+            )
+            return
+
+        member = guild.get_member(
+            interaction.user.id
+        )
+
+        if not member:
+
+            await interaction.response.send_message(
+                "❌ ไม่พบสมาชิก",
+                ephemeral=True
+            )
+            return
+
         try:
-            target_msg = await channel.fetch_message(msg_id)
-            view = DynamicSelfRoleView(new_roles_data)
-            await target_msg.edit(view=view)
+
+            if role in member.roles:
+
+                await member.remove_roles(
+                    role,
+                    reason="Self Role Button"
+                )
+
+                await interaction.response.send_message(
+                    f"➖ ถอดยศ {role.mention} แล้ว",
+                    ephemeral=True
+                )
+
+            else:
+
+                await member.add_roles(
+                    role,
+                    reason="Self Role Button"
+                )
+
+                await interaction.response.send_message(
+                    f"✅ รับยศ {role.mention} แล้ว",
+                    ephemeral=True
+                )
+
+        except discord.Forbidden:
+
+            await interaction.response.send_message(
+                "❌ บอทไม่มีสิทธิ์จัดการยศนี้",
+                ephemeral=True
+            )
+
+        except discord.HTTPException:
+
+            await interaction.response.send_message(
+                "❌ Discord API เกิดข้อผิดพลาด",
+                ephemeral=True
+            )
+
+
+class SelfRoleView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        guild_id: int
+    ):
+
+        super().__init__(
+            timeout=None
+        )
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT role_id, label, emoji, custom_id
+            FROM self_roles
+            WHERE guild_id = ?
+            ORDER BY role_id
+            LIMIT 25
+            """,
+            (guild_id,)
+        )
+
+        rows = cur.fetchall()
+        conn.close()
+
+        for row in rows:
+
+            self.add_item(
+                RoleButton(
+                    guild_id=guild_id,
+                    role_id=row["role_id"],
+                    label=row["label"],
+                    emoji=row["emoji"],
+                    custom_id=row["custom_id"]
+                )
+            )
+
+
+# ============================================================
+# LOAD PERSISTENT VIEWS
+# ============================================================
+
+async def load_persistent_role_views():
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT guild_id, message_id
+        FROM role_panels
+        """
+    )
+
+    panels = cur.fetchall()
+    conn.close()
+
+    for panel in panels:
+
+        try:
+
+            view = SelfRoleView(
+                panel["guild_id"]
+            )
+
+            bot.add_view(
+                view,
+                message_id=panel["message_id"]
+            )
+
         except Exception as e:
+
+            logger.error(
+                "Failed loading role panel %s: %s",
+                panel["message_id"],
+                e
+            )
+
+
+# ============================================================
+# UPDATE ROLE PANEL
+# ============================================================
+
+async def update_role_panel(
+    guild: discord.Guild
+):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT *
+        FROM role_panels
+        WHERE guild_id = ?
+        """,
+        (guild.id,)
+    )
+
+    panel = cur.fetchone()
+
+    conn.close()
+
+    if not panel:
+        return
+
+    channel = guild.get_channel(
+        panel["channel_id"]
+    )
+
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
+        return
+
+    try:
+
+        message = await channel.fetch_message(
+            panel["message_id"]
+        )
+
+    except discord.HTTPException:
+        return
+
+    embed = discord.Embed(
+        title=panel["title"],
+        description=panel["description"] or "",
+        color=discord.Color.blurple()
+    )
+
+    if panel["image_url"]:
+        embed.set_image(
+            url=panel["image_url"]
+        )
+
+    view = SelfRoleView(
+        guild.id
+    )
+
+    try:
+
+        await message.edit(
+            embed=embed,
+            view=view
+        )
+
+    except discord.HTTPException as e:
+
+        logger.error(
+            "Failed updating role panel: %s",
+            e
+        )
+
+
+# ============================================================
+# /add_role
+# ============================================================
+
+@bot.tree.command(
+    name="add_role",
+    description="เพิ่มยศเข้าแผงรับยศ"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    role="ยศที่ต้องการเพิ่ม",
+    label="ชื่อบนปุ่ม",
+    emoji="Emoji ของปุ่ม"
+)
+async def add_role(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    label: Optional[str] = None,
+    emoji: Optional[str] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_roles"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Roles"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "manage_roles"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Manage Roles`",
+            ephemeral=True
+        )
+        return
+
+    if not bot_can_manage_role(
+        interaction.guild,
+        role
+    ):
+
+        await interaction.response.send_message(
+            "❌ ยศนี้อยู่สูงกว่าหรือเท่ากับยศสูงสุดของบอท",
+            ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM self_roles
+        WHERE guild_id = ?
+        """,
+        (interaction.guild.id,)
+    )
+
+    count = cur.fetchone()[0]
+
+    if count >= 25:
+
+        conn.close()
+
+        await interaction.response.send_message(
+            "❌ แผงหนึ่งสามารถมีปุ่มได้สูงสุด 25 ปุ่ม",
+            ephemeral=True
+        )
+        return
+
+    custom_id = (
+        f"selfrole:{interaction.guild.id}:{role.id}"
+    )
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO self_roles
+        (
+            guild_id,
+            role_id,
+            label,
+            emoji,
+            custom_id
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            interaction.guild.id,
+            role.id,
+            (label or role.name)[:80],
+            emoji,
+            custom_id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    await update_role_panel(
+        interaction.guild
+    )
+
+    await interaction.response.send_message(
+        f"✅ เพิ่ม {role.mention} เข้าแผงรับยศแล้ว",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /remove_role
+# ============================================================
+
+@bot.tree.command(
+    name="remove_role",
+    description="ลบยศออกจากแผงรับยศ"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    role="ยศที่ต้องการลบออกจากระบบ"
+)
+async def remove_role(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+
+    if not has_permission(
+        interaction,
+        "manage_roles"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Roles"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM self_roles
+        WHERE guild_id = ?
+        AND role_id = ?
+        """,
+        (
+            interaction.guild.id,
+            role.id
+        )
+    )
+
+    deleted = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    if not deleted:
+
+        await interaction.response.send_message(
+            "❌ ยศนี้ไม่ได้อยู่ในระบบรับยศ",
+            ephemeral=True
+        )
+        return
+
+    await update_role_panel(
+        interaction.guild
+    )
+
+    await interaction.response.send_message(
+        f"✅ ลบ {role.mention} ออกจากแผงรับยศแล้ว",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /ban
+# ============================================================
+
+@bot.tree.command(
+    name="ban",
+    description="แบนสมาชิกออกจากเซิร์ฟเวอร์"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการแบน",
+    reason="เหตุผลในการแบน"
+)
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "ไม่ได้ระบุเหตุผล"
+):
+
+    if not has_permission(
+        interaction,
+        "ban_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Ban Members"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "ban_members"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Ban Members`",
+            ephemeral=True
+        )
+        return
+
+    if not member_target_valid(
+        interaction.guild,
+        member
+    ):
+
+        await interaction.response.send_message(
+            "❌ ไม่สามารถแบนสมาชิกที่มียศสูงกว่าหรือเท่ากับบอทได้",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        await member.ban(
+            reason=reason
+        )
+
+        await interaction.response.send_message(
+            f"🔨 แบน {member.mention} แล้ว\n"
+            f"เหตุผล: {reason}"
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์แบนสมาชิกนี้",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /kick
+# ============================================================
+
+@bot.tree.command(
+    name="kick",
+    description="เตะสมาชิกออกจากเซิร์ฟเวอร์"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการเตะ",
+    reason="เหตุผลในการเตะ"
+)
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "ไม่ได้ระบุเหตุผล"
+):
+
+    if not has_permission(
+        interaction,
+        "kick_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Kick Members"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "kick_members"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Kick Members`",
+            ephemeral=True
+        )
+        return
+
+    if not member_target_valid(
+        interaction.guild,
+        member
+    ):
+
+        await interaction.response.send_message(
+            "❌ ไม่สามารถเตะสมาชิกที่มียศสูงกว่าหรือเท่ากับบอทได้",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        await member.kick(
+            reason=reason
+        )
+
+        await interaction.response.send_message(
+            f"👢 เตะ {member.mention} แล้ว\n"
+            f"เหตุผล: {reason}"
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์เตะสมาชิกนี้",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /timeout
+# ============================================================
+
+@bot.tree.command(
+    name="timeout",
+    description="Timeout สมาชิกชั่วคราว"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการ Timeout",
+    minutes="จำนวนนาที",
+    reason="เหตุผล"
+)
+async def timeout(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "ไม่ได้ระบุเหตุผล"
+):
+
+    if not has_permission(
+        interaction,
+        "moderate_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Moderate Members"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "moderate_members"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Moderate Members`",
+            ephemeral=True
+        )
+        return
+
+    if not member_target_valid(
+        interaction.guild,
+        member
+    ):
+
+        await interaction.response.send_message(
+            "❌ ไม่สามารถ Timeout สมาชิกที่มียศสูงกว่าหรือเท่ากับบอทได้",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        until = discord.utils.utcnow() + timedelta(
+            minutes=minutes
+        )
+
+        await member.timeout(
+            until,
+            reason=reason
+        )
+
+        await interaction.response.send_message(
+            f"⏱️ Timeout {member.mention} "
+            f"เป็นเวลา **{minutes} นาที** แล้ว"
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์ Timeout สมาชิกนี้",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /untimeout
+# ============================================================
+
+@bot.tree.command(
+    name="untimeout",
+    description="ยกเลิก Timeout สมาชิก"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการยกเลิก Timeout"
+)
+async def untimeout(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not has_permission(
+        interaction,
+        "moderate_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Moderate Members"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "moderate_members"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Moderate Members`",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        await member.timeout(
+            None,
+            reason=f"Untimeout by {interaction.user}"
+        )
+
+        await interaction.response.send_message(
+            f"✅ ยกเลิก Timeout {member.mention} แล้ว"
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์ยกเลิก Timeout สมาชิกนี้",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /warn
+# ============================================================
+
+@bot.tree.command(
+    name="warn",
+    description="เตือนสมาชิก"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการเตือน",
+    reason="เหตุผล"
+)
+async def warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "ไม่ได้ระบุเหตุผล"
+):
+
+    if not has_permission(
+        interaction,
+        "moderate_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Moderate Members"
+        )
+        return
+
+    if not member_target_valid(
+        interaction.guild,
+        member
+    ):
+
+        await interaction.response.send_message(
+            "❌ ไม่สามารถ Warn สมาชิกที่มียศสูงกว่าหรือเท่ากับบอทได้",
+            ephemeral=True
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO warnings
+        (
+            guild_id,
+            user_id,
+            moderator_id,
+            reason,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            interaction.guild.id,
+            member.id,
+            interaction.user.id,
+            reason,
+            datetime.now(UTC).isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"⚠️ Warn {member.mention} แล้ว\n"
+        f"เหตุผล: {reason}"
+    )
+
+
+# ============================================================
+# /warnings
+# ============================================================
+
+@bot.tree.command(
+    name="warnings",
+    description="ดูประวัติคำเตือนของสมาชิก"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการดูคำเตือน"
+)
+async def warnings(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not has_permission(
+        interaction,
+        "moderate_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Moderate Members"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT *
+        FROM warnings
+        WHERE guild_id = ?
+        AND user_id = ?
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        (
+            interaction.guild.id,
+            member.id
+        )
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings - {member}",
+        color=discord.Color.orange()
+    )
+
+    if not rows:
+
+        embed.description = "ไม่มีประวัติคำเตือน"
+
+    else:
+
+        lines = []
+
+        for row in rows:
+
+            moderator = interaction.guild.get_member(
+                row["moderator_id"]
+            )
+
+            moderator_text = (
+                moderator.mention
+                if moderator
+                else f"<@{row['moderator_id']}>"
+            )
+
+            lines.append(
+                f"**#{row['id']}** — {row['reason']}\n"
+                f"โดย {moderator_text}"
+            )
+
+        embed.description = "\n\n".join(
+            lines
+        )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /clearwarn
+# ============================================================
+
+@bot.tree.command(
+    name="clearwarn",
+    description="ล้างคำเตือนของสมาชิกทั้งหมด"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="สมาชิกที่ต้องการล้างคำเตือน"
+)
+async def clearwarn(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not has_permission(
+        interaction,
+        "moderate_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Moderate Members"
+        )
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        DELETE FROM warnings
+        WHERE guild_id = ?
+        AND user_id = ?
+        """,
+        (
+            interaction.guild.id,
+            member.id
+        )
+    )
+
+    deleted = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(
+        f"🧹 ล้างคำเตือน {member.mention} แล้ว "
+        f"จำนวน **{deleted}** รายการ"
+    )
+
+
+# ============================================================
+# /purge
+# ============================================================
+
+@bot.tree.command(
+    name="purge",
+    description="ลบข้อความย้อนหลังตามจำนวนที่กำหนด"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    amount="จำนวนข้อความที่ต้องการลบ 1-100"
+)
+async def purge(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 100]
+):
+
+    if not has_permission(
+        interaction,
+        "manage_messages"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Messages"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "manage_messages"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Manage Messages`",
+            ephemeral=True
+        )
+        return
+
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel
+    ):
+
+        await interaction.response.send_message(
+            "❌ คำสั่งนี้ใช้ใน Text Channel เท่านั้น",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    try:
+
+        deleted = await interaction.channel.purge(
+            limit=amount
+        )
+
+        await interaction.followup.send(
+            f"🧹 ลบข้อความแล้ว **{len(deleted)}** ข้อความ",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.followup.send(
+            "❌ บอทไม่มีสิทธิ์ลบข้อความ",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /unban
+# ============================================================
+
+@bot.tree.command(
+    name="unban",
+    description="ปลดแบนสมาชิกด้วย User ID"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    user_id="Discord User ID ของคนที่ต้องการปลดแบน"
+)
+async def unban(
+    interaction: discord.Interaction,
+    user_id: str
+):
+
+    if not has_permission(
+        interaction,
+        "ban_members"
+    ):
+
+        await permission_error(
+            interaction,
+            "Ban Members"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "ban_members"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Ban Members`",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        user = await bot.fetch_user(
+            int(user_id)
+        )
+
+    except (ValueError, discord.NotFound):
+
+        await interaction.response.send_message(
+            "❌ User ID ไม่ถูกต้องหรือไม่พบผู้ใช้",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        await interaction.guild.unban(
+            user
+        )
+
+        await interaction.response.send_message(
+            f"✅ ปลดแบน {user.mention} แล้ว"
+        )
+
+    except discord.NotFound:
+
+        await interaction.response.send_message(
+            "❌ ผู้ใช้นี้ไม่ได้ถูกแบน",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์ปลดแบน",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /announce
+# ============================================================
+
+@bot.tree.command(
+    name="announce",
+    description="ส่งประกาศไปยังห้องที่กำหนด"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="ห้องที่จะส่งประกาศ",
+    message="ข้อความประกาศ",
+    embed="ให้ส่งเป็น Embed หรือไม่",
+    image_url="URL รูปภาพหรือ GIF"
+)
+async def announce(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    message: str,
+    embed: bool = True,
+    image_url: Optional[str] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_guild"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Server"
+        )
+        return
+
+    if not bot_has_permission(
+        interaction.guild,
+        "send_messages"
+    ):
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มี Permission `Send Messages`",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        if embed:
+
+            announcement = discord.Embed(
+                description=message[:4096],
+                color=discord.Color.blurple()
+            )
+
+            if image_url:
+                announcement.set_image(
+                    url=image_url
+                )
+
+            await channel.send(
+                embed=announcement
+            )
+
+        else:
+
+            content = message
+
+            if image_url:
+                content += f"\n{image_url}"
+
+            await channel.send(
+                content=content
+            )
+
+        await interaction.response.send_message(
+            f"📢 ส่งประกาศไปที่ {channel.mention} แล้ว",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ บอทไม่มีสิทธิ์ส่งข้อความในห้องนั้น",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# MEMBER SYSTEM CONFIG BUILDER
+# ============================================================
+
+def build_member_embed(
+    title: str,
+    message: str,
+    image_url: Optional[str],
+    member: discord.Member
+) -> discord.Embed:
+
+    text = replace_variables(
+        message,
+        member
+    )
+
+    embed = discord.Embed(
+        title=title,
+        description=text[:4096],
+        color=discord.Color.blurple()
+    )
+
+    if image_url:
+        embed.set_image(
+            url=image_url
+        )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    return embed
+
+
+# ============================================================
+# /setwelcome
+# ============================================================
+
+@bot.tree.command(
+    name="setwelcome",
+    description="ตั้งค่าระบบต้อนรับสมาชิกใหม่"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="ห้องที่จะส่ง Welcome",
+    message="ข้อความ เช่น ยินดีต้อนรับ {user} สู่ {server}",
+    image_url="URL รูปภาพหรือ GIF",
+    embed="ส่งเป็น Embed หรือไม่",
+    enabled="เปิดหรือปิดระบบ"
+)
+async def setwelcome(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    message: Optional[str] = None,
+    image_url: Optional[str] = None,
+    embed: bool = True,
+    enabled: Optional[bool] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_guild"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Server"
+        )
+        return
+
+    ensure_guild_settings(
+        interaction.guild.id
+    )
+
+    current = get_guild_settings(
+        interaction.guild.id
+    )
+
+    new_channel = (
+        channel.id
+        if channel
+        else current["welcome_channel_id"]
+    )
+
+    new_message = (
+        message
+        if message is not None
+        else current["welcome_message"]
+    )
+
+    new_image = (
+        image_url
+        if image_url is not None
+        else current["welcome_image"]
+    )
+
+    new_enabled = (
+        int(enabled)
+        if enabled is not None
+        else current["welcome_enabled"]
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE guild_settings
+        SET
+            welcome_enabled = ?,
+            welcome_channel_id = ?,
+            welcome_message = ?,
+            welcome_image = ?,
+            welcome_embed = ?
+        WHERE guild_id = ?
+        """,
+        (
+            new_enabled,
+            new_channel,
+            new_message,
+            new_image,
+            int(embed),
+            interaction.guild.id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    status = "เปิด" if new_enabled else "ปิด"
+
+    await interaction.response.send_message(
+        f"👋 Welcome: **{status}**\n"
+        f"ห้อง: "
+        f"{f'<#{new_channel}>' if new_channel else 'ยังไม่ได้ตั้ง'}",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /setgoodbye
+# ============================================================
+
+@bot.tree.command(
+    name="setgoodbye",
+    description="ตั้งค่าระบบแจ้งเตือนสมาชิกออก"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="ห้องที่จะส่ง Goodbye",
+    message="ข้อความ เช่น ลาก่อน {user} จาก {server}",
+    image_url="URL รูปภาพหรือ GIF",
+    embed="ส่งเป็น Embed หรือไม่",
+    enabled="เปิดหรือปิดระบบ"
+)
+async def setgoodbye(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    message: Optional[str] = None,
+    image_url: Optional[str] = None,
+    embed: bool = True,
+    enabled: Optional[bool] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_guild"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Server"
+        )
+        return
+
+    ensure_guild_settings(
+        interaction.guild.id
+    )
+
+    current = get_guild_settings(
+        interaction.guild.id
+    )
+
+    new_channel = (
+        channel.id
+        if channel
+        else current["goodbye_channel_id"]
+    )
+
+    new_message = (
+        message
+        if message is not None
+        else current["goodbye_message"]
+    )
+
+    new_image = (
+        image_url
+        if image_url is not None
+        else current["goodbye_image"]
+    )
+
+    new_enabled = (
+        int(enabled)
+        if enabled is not None
+        else current["goodbye_enabled"]
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE guild_settings
+        SET
+            goodbye_enabled = ?,
+            goodbye_channel_id = ?,
+            goodbye_message = ?,
+            goodbye_image = ?,
+            goodbye_embed = ?
+        WHERE guild_id = ?
+        """,
+        (
+            new_enabled,
+            new_channel,
+            new_message,
+            new_image,
+            int(embed),
+            interaction.guild.id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    status = "เปิด" if new_enabled else "ปิด"
+
+    await interaction.response.send_message(
+        f"👋 Goodbye: **{status}**\n"
+        f"ห้อง: "
+        f"{f'<#{new_channel}>' if new_channel else 'ยังไม่ได้ตั้ง'}",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /setboots
+# ============================================================
+
+@bot.tree.command(
+    name="setboots",
+    description="ตั้งค่าระบบแจ้งเตือนเมื่อมีสมาชิก Boost"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="ห้องที่จะส่งข้อความ Boost",
+    message="ข้อความ เช่น ขอบคุณ {user} ที่ Boost {server}",
+    image_url="URL รูปภาพหรือ GIF",
+    embed="ส่งเป็น Embed หรือไม่",
+    enabled="เปิดหรือปิดระบบ"
+)
+async def setboots(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    message: Optional[str] = None,
+    image_url: Optional[str] = None,
+    embed: bool = True,
+    enabled: Optional[bool] = None
+):
+
+    if not has_permission(
+        interaction,
+        "manage_guild"
+    ):
+
+        await permission_error(
+            interaction,
+            "Manage Server"
+        )
+        return
+
+    ensure_guild_settings(
+        interaction.guild.id
+    )
+
+    current = get_guild_settings(
+        interaction.guild.id
+    )
+
+    new_channel = (
+        channel.id
+        if channel
+        else current["boost_channel_id"]
+    )
+
+    new_message = (
+        message
+        if message is not None
+        else current["boost_message"]
+    )
+
+    new_image = (
+        image_url
+        if image_url is not None
+        else current["boost_image"]
+    )
+
+    new_enabled = (
+        int(enabled)
+        if enabled is not None
+        else current["boost_enabled"]
+    )
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE guild_settings
+        SET
+            boost_enabled = ?,
+            boost_channel_id = ?,
+            boost_message = ?,
+            boost_image = ?,
+            boost_embed = ?
+        WHERE guild_id = ?
+        """,
+        (
+            new_enabled,
+            new_channel,
+            new_message,
+            new_image,
+            int(embed),
+            interaction.guild.id
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    status = "เปิด" if new_enabled else "ปิด"
+
+    await interaction.response.send_message(
+        f"🚀 Boost Notification: **{status}**\n"
+        f"ห้อง: "
+        f"{f'<#{new_channel}>' if new_channel else 'ยังไม่ได้ตั้ง'}",
+        ephemeral=True
+    )
+
+
+# ============================================================
+# WELCOME EVENT
+# ============================================================
+
+@bot.event
+async def on_member_join(
+    member: discord.Member
+):
+
+    try:
+
+        settings = get_guild_settings(
+            member.guild.id
+        )
+
+        if not settings["welcome_enabled"]:
+            return
+
+        channel_id = settings[
+            "welcome_channel_id"
+        ]
+
+        message = settings[
+            "welcome_message"
+        ]
+
+        if not channel_id or not message:
+            return
+
+        channel = member.guild.get_channel(
+            channel_id
+        )
+
+        if not isinstance(
+            channel,
+            discord.TextChannel
+        ):
+            return
+
+        if settings["welcome_embed"]:
+
+            embed = build_member_embed(
+                "👋 Welcome!",
+                message,
+                settings["welcome_image"],
+                member
+            )
+
+            await channel.send(
+                embed=embed
+            )
+
+        else:
+
+            text = replace_variables(
+                message,
+                member
+            )
+
+            if settings["welcome_image"]:
+                text += (
+                    f"\n{settings['welcome_image']}"
+                )
+
+            await channel.send(
+                text
+            )
+
+    except Exception as e:
+
+        logger.error(
+            "Welcome event error: %s",
+            e
+        )
+
+
+# ============================================================
+# GOODBYE EVENT
+# ============================================================
+
+@bot.event
+async def on_member_remove(
+    member: discord.Member
+):
+
+    try:
+
+        settings = get_guild_settings(
+            member.guild.id
+        )
+
+        if not settings["goodbye_enabled"]:
+            return
+
+        channel_id = settings[
+            "goodbye_channel_id"
+        ]
+
+        message = settings[
+            "goodbye_message"
+        ]
+
+        if not channel_id or not message:
+            return
+
+        channel = member.guild.get_channel(
+            channel_id
+        )
+
+        if not isinstance(
+            channel,
+            discord.TextChannel
+        ):
+            return
+
+        if settings["goodbye_embed"]:
+
+            embed = build_member_embed(
+                "👋 Goodbye!",
+                message,
+                settings["goodbye_image"],
+                member
+            )
+
+            await channel.send(
+                embed=embed
+            )
+
+        else:
+
+            text = replace_variables(
+                message,
+                member
+            )
+
+            if settings["goodbye_image"]:
+                text += (
+                    f"\n{settings['goodbye_image']}"
+                )
+
+            await channel.send(
+                text
+            )
+
+    except Exception as e:
+
+        logger.error(
+            "Goodbye event error: %s",
+            e
+        )
+
+
+# ============================================================
+# BOOST EVENT
+# ============================================================
+
+@bot.event
+async def on_member_update(
+    before: discord.Member,
+    after: discord.Member
+):
+
+    try:
+
+        # Only detect first-time/new boost
+        if (
+            before.premium_since is not None
+            or after.premium_since is None
+        ):
+            return
+
+        settings = get_guild_settings(
+            after.guild.id
+        )
+
+        if not settings["boost_enabled"]:
+            return
+
+        channel_id = settings[
+            "boost_channel_id"
+        ]
+
+        message = settings[
+            "boost_message"
+        ]
+
+        if not channel_id or not message:
+            return
+
+        channel = after.guild.get_channel(
+            channel_id
+        )
+
+        if not isinstance(
+            channel,
+            discord.TextChannel
+        ):
+            return
+
+        if settings["boost_embed"]:
+
+            embed = build_member_embed(
+                "🚀 Server Boost!",
+                message,
+                settings["boost_image"],
+                after
+            )
+
+            await channel.send(
+                embed=embed
+            )
+
+        else:
+
+            text = replace_variables(
+                message,
+                after
+            )
+
+            if settings["boost_image"]:
+                text += (
+                    f"\n{settings['boost_image']}"
+                )
+
+            await channel.send(
+                text
+            )
+
+    except Exception as e:
+
+        logger.error(
+            "Boost event error: %s",
+            e
+        )
+
+
+# ============================================================
+# BOT READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    logger.info("=" * 60)
+
+    logger.info(
+        "Bot Online: %s (%s)",
+        bot.user,
+        bot.user.id if bot.user else "unknown"
+    )
+
+    logger.info(
+        "จำนวนเซิร์ฟเวอร์: %d",
+        len(bot.guilds)
+    )
+
+    # Activity: Listening to /play
+    activity = discord.Activity(
+        type=discord.ActivityType.listening,
+        name="/play"
+    )
+
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=activity
+    )
+
+    logger.info(
+        "Activity: Listening to /play"
+    )
+
+    logger.info("=" * 60)
+
+
+# ============================================================
+# GLOBAL SLASH COMMAND ERROR HANDLER
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError
+):
+
+    logger.error(
+        "Slash Command Error: %s",
+        error
+    )
+
+    # --------------------------------------------------------
+    # Permission
+    # --------------------------------------------------------
+
+    if isinstance(
+        error,
+        app_commands.MissingPermissions
+    ):
+
+        message = (
+            "❌ คุณไม่มี Permission "
+            "สำหรับใช้คำสั่งนี้"
+        )
+
+    # --------------------------------------------------------
+    # Bot Permission
+    # --------------------------------------------------------
+
+    elif isinstance(
+        error,
+        app_commands.BotMissingPermissions
+    ):
+
+        message = (
+            "❌ บอทไม่มี Permission "
+            "ที่จำเป็นสำหรับคำสั่งนี้"
+        )
+
+    # --------------------------------------------------------
+    # Check Failure
+    # --------------------------------------------------------
+
+    elif isinstance(
+        error,
+        app_commands.CheckFailure
+    ):
+
+        message = (
+            "❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้"
+        )
+
+    # --------------------------------------------------------
+    # Command Not Found
+    # --------------------------------------------------------
+
+    elif isinstance(
+        error,
+        app_commands.CommandNotFound
+    ):
+
+        message = (
+            "❌ ไม่พบ Slash Command นี้"
+        )
+
+    # --------------------------------------------------------
+    # Discord HTTP
+    # --------------------------------------------------------
+
+    elif isinstance(
+        error,
+        discord.HTTPException
+    ):
+
+        message = (
+            "❌ Discord API เกิดข้อผิดพลาด "
+            "กรุณาลองใหม่อีกครั้ง"
+        )
+
+    # --------------------------------------------------------
+    # Generic
+    # --------------------------------------------------------
+
+    else:
+
+        original = getattr(
+            error,
+            "original",
+            error
+        )
+
+        message = (
+            "❌ เกิดข้อผิดพลาดที่ไม่คาดคิด\n"
+            f"`{type(original).__name__}: "
+            f"{original}`"
+        )
+
+    try:
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
+
+    except Exception as e:
+
+        logger.error(
+            "Could not send error response: %s",
+            e
+        )
+
+
+# ============================================================
+# NORMAL BOT ERROR
+# ============================================================
+
+@bot.event
+async def on_error(
+    event_method,
+    *args,
+    **kwargs
+):
+
+    logger.exception(
+        "Unhandled Discord event error: %s",
+        event_method
+    )
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+async def close_bot():
+
+    for session in music_sessions.values():
+
+        try:
+
+            if session.voice_client:
+                await session.voice_client.disconnect()
+
+        except Exception:
             pass
 
-    await interaction.followup.send(f"✅ ลบยศ **{role.name}** ออกจากแผงรับยศเรียบร้อยแล้ว")
+    await bot.close()
 
-# =========================================================
-# MODERATION COMMANDS
-# =========================================================
 
-@client.tree.command(name="ban", description="แบนสมาชิกออกจากเซิร์ฟเวอร์")
-@app_commands.describe(member="สมาชิกที่ต้องการแบน", reason="เหตุผลในการแบน")
-@app_commands.checks.has_permissions(ban_members=True)
-async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "ไม่ได้ระบุเหตุผล"):
-    if member.top_role >= interaction.user.top_role:
-        return await interaction.response.send_message("❌ คุณไม่สามารถแบนผู้ที่มียศสูงกว่าหรือเท่ากับคุณได้", ephemeral=True)
-    await member.ban(reason=reason)
-    await interaction.response.send_message(f"🔨 แบน {member.mention} เรียบร้อยแล้ว | เหตุผล: {reason}")
-
-@client.tree.command(name="unban", description="ปลดแบนผู้ใช้ด้วย User ID")
-@app_commands.describe(user_id="ID ของผู้ใช้ที่ต้องการปลดแบน")
-@app_commands.checks.has_permissions(ban_members=True)
-async def unban(interaction: discord.Interaction, user_id: str):
-    try:
-        uid = int(user_id)
-        user = await client.fetch_user(uid)
-        await interaction.guild.unban(user)
-        await interaction.response.send_message(f"🔓 ปลดแบน **{user}** เรียบร้อยแล้ว")
-    except Exception as e:
-        await interaction.response.send_message(f"❌ ไม่สามารถปลดแบนได้: {e}", ephemeral=True)
-
-@client.tree.command(name="kick", description="เตะสมาชิกออกจากเซิร์ฟเวอร์")
-@app_commands.describe(member="สมาชิกที่ต้องการเตะ", reason="เหตุผลในการเตะ")
-@app_commands.checks.has_permissions(kick_members=True)
-async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "ไม่ได้ระบุเหตุผล"):
-    if member.top_role >= interaction.user.top_role:
-        return await interaction.response.send_message("❌ คุณไม่สามารถเตะผู้ที่มียศสูงกว่าหรือเท่ากับคุณได้", ephemeral=True)
-    await member.kick(reason=reason)
-    await interaction.response.send_message(f"👢 เตะ {member.mention} เรียบร้อยแล้ว | เหตุผล: {reason}")
-
-@client.tree.command(name="timeout", description="ระงับการพิมพ์/ส่งข้อความชั่วคราว (Timeout)")
-@app_commands.describe(member="สมาชิกที่ต้องการ Timeout", minutes="จำนวนนาทีที่ต้องการระงับ", reason="เหตุผล")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "ไม่ได้ระบุเหตุผล"):
-    duration = datetime.timedelta(minutes=minutes)
-    await member.timeout(duration, reason=reason)
-    await interaction.response.send_message(f"⏳ Timeout {member.mention} เป็นเวลา {minutes} นาที | เหตุผล: {reason}")
-
-@client.tree.command(name="untimeout", description="ยกเลิก Timeout สมาชิก")
-@app_commands.describe(member="สมาชิกที่ต้องการยกเลิก Timeout")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def untimeout(interaction: discord.Interaction, member: discord.Member):
-    await member.timeout(None)
-    await interaction.response.send_message(f"🔊 ยกเลิก Timeout {member.mention} เรียบร้อยแล้ว")
-
-@client.tree.command(name="warn", description="ตักเตือนสมาชิกและบันทึกลงระบบ")
-@app_commands.describe(member="สมาชิกที่ต้องการเตือน", reason="เหตุผลในการเตือน")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db_execute(
-        "INSERT INTO warnings (guild_id, user_id, reason, moderator_id, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (interaction.guild.id, member.id, reason, interaction.user.id, now)
-    )
-    await interaction.response.send_message(f"⚠️ เตือน {member.mention} เรียบร้อยแล้ว | เหตุผล: {reason}")
-
-@client.tree.command(name="warnings", description="ดูประวัติการตักเตือนของสมาชิก")
-@app_commands.describe(member="สมาชิกที่ต้องการดูประวัติ")
-async def warnings(interaction: discord.Interaction, member: discord.Member):
-    rows = db_fetch_all("SELECT id, reason, timestamp FROM warnings WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, member.id))
-    if not rows:
-        return await interaction.response.send_message(f"✅ {member.mention} ไม่มีประวัติการเตือน", ephemeral=True)
-
-    desc = "\n".join([f"`ID: {r[0]}` - {r[1]} *(เมื่อ {r[2]})*" for r in rows])
-    embed = discord.Embed(title=f"⚠️ ประวัติการเตือนของ {member.display_name}", description=desc, color=discord.Color.orange())
-    await interaction.response.send_message(embed=embed)
-
-@client.tree.command(name="clearwarn", description="ล้างประวัติการตักเตือนของสมาชิก")
-@app_commands.describe(member="สมาชิกที่ต้องการล้างประวัติเตือน")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def clearwarn(interaction: discord.Interaction, member: discord.Member):
-    db_execute("DELETE FROM warnings WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, member.id))
-    await interaction.response.send_message(f"🧹 ล้างประวัติการเตือนของ {member.mention} เรียบร้อยแล้ว")
-
-@client.tree.command(name="purge", description="ลบข้อความจำนวนมาก")
-@app_commands.describe(amount="จำนวนข้อความที่ต้องการลบ (1-100)")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def purge(interaction: discord.Interaction, amount: int):
-    if amount < 1 or amount > 100:
-        return await interaction.response.send_message("❌ กรุณาระบุจำนวน 1 ถึง 100 ข้อความ", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(f"🧹 ลบข้อความแล้วจำนวน {len(deleted)} ข้อความ", ephemeral=True)
-
-# =========================================================
-# MANAGEMENT / ANNOUNCE COMMAND
-# =========================================================
-
-@client.tree.command(name="announce", description="ส่งข้อความประกาศในรูปแบบ Embed")
-@app_commands.describe(channel="ช่องที่ต้องการส่งประกาศ", message="ข้อความประกาศ", title="หัวข้อประกาศ")
-@app_commands.checks.has_permissions(administrator=True)
-async def announce(interaction: discord.Interaction, channel: discord.TextChannel, message: str, title: str = "📢 ประกาศสำคัญ"):
-    embed = discord.Embed(title=title, description=message, color=discord.Color.blue())
-    embed.set_footer(text=f"ประกาศโดย {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
-    await channel.send(embed=embed)
-    await interaction.response.send_message(f"✅ ส่งประกาศไปที่ {channel.mention} เรียบร้อยแล้ว", ephemeral=True)
-
-# =========================================================
-# MEMBER EVENTS & CONFIGURATION COMMANDS
-# =========================================================
-
-def get_or_create_config(guild_id: int):
-    row = db_fetch_one("SELECT * FROM server_configs WHERE guild_id = ?", (guild_id,))
-    if not row:
-        db_execute("INSERT INTO server_configs (guild_id) VALUES (?)", (guild_id,))
-
-@client.tree.command(name="setwelcome", description="ตั้งค่าระบบข้อความต้อนรับสมาชิกใหม่")
-@app_commands.describe(
-    channel="ช่องสำหรับส่งข้อความต้อนรับ",
-    message="ข้อความ (ใช้ {user}, {username}, {server}, {member_count} ได้)",
-    image_url="URL รูปภาพหรือ GIF ประกอบ (ไม่ใส่ก็ได้)",
-    enabled="เปิดหรือปิดระบบต้อนรับ"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setwelcome(interaction: discord.Interaction, channel: discord.TextChannel, message: str, enabled: bool, image_url: str = None):
-    get_or_create_config(interaction.guild.id)
-    db_execute(
-        "UPDATE server_configs SET welcome_channel_id = ?, welcome_msg = ?, welcome_img = ?, welcome_enabled = ? WHERE guild_id = ?",
-        (channel.id, message, image_url or "", 1 if enabled else 0, interaction.guild.id)
-    )
-    await interaction.response.send_message(f"✅ ตั้งค่าระบบ Welcome ไปยังช่อง {channel.mention} (สถานะ: {'เปิด' if enabled else 'ปิด'}) เรียบร้อยแล้ว")
-
-@client.tree.command(name="setgoodbye", description="ตั้งค่าระบบข้อความแจ้งสมาชิกออกจากเซิร์ฟเวอร์")
-@app_commands.describe(
-    channel="ช่องสำหรับส่งข้อความอำลา",
-    message="ข้อความ (ใช้ {user}, {username}, {server}, {member_count} ได้)",
-    image_url="URL รูปภาพหรือ GIF ประกอบ (ไม่ใส่ก็ได้)",
-    enabled="เปิดหรือปิดระบบอำลา"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setgoodbye(interaction: discord.Interaction, channel: discord.TextChannel, message: str, enabled: bool, image_url: str = None):
-    get_or_create_config(interaction.guild.id)
-    db_execute(
-        "UPDATE server_configs SET goodbye_channel_id = ?, goodbye_msg = ?, goodbye_img = ?, goodbye_enabled = ? WHERE guild_id = ?",
-        (channel.id, message, image_url or "", 1 if enabled else 0, interaction.guild.id)
-    )
-    await interaction.response.send_message(f"✅ ตั้งค่าระบบ Goodbye ไปยังช่อง {channel.mention} (สถานะ: {'เปิด' if enabled else 'ปิด'}) เรียบร้อยแล้ว")
-
-@client.tree.command(name="setboots", description="ตั้งค่าระบบแจ้งเตือนเมื่อมีคน Boost เซิร์ฟเวอร์")
-@app_commands.describe(
-    channel="ช่องสำหรับแจ้งเตือน Boost",
-    message="ข้อความ (ใช้ {user}, {username}, {server} ได้)",
-    image_url="URL รูปภาพหรือ GIF ประกอบ (ไม่ใส่ก็ได้)",
-    enabled="เปิดหรือปิดระบบแจ้งเตือน Boost"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def setboots(interaction: discord.Interaction, channel: discord.TextChannel, message: str, enabled: bool, image_url: str = None):
-    get_or_create_config(interaction.guild.id)
-    db_execute(
-        "UPDATE server_configs SET boost_channel_id = ?, boost_msg = ?, boost_img = ?, boost_enabled = ? WHERE guild_id = ?",
-        (channel.id, message, image_url or "", 1 if enabled else 0, interaction.guild.id)
-    )
-    await interaction.response.send_message(f"✅ ตั้งค่าระบบ Boost Alert ไปยังช่อง {channel.mention} (สถานะ: {'เปิด' if enabled else 'ปิด'}) เรียบร้อยแล้ว")
-
-# Listeners for Member Join/Leave/Update (Boost)
-@client.event
-async def on_member_join(member: discord.Member):
-    row = db_fetch_one("SELECT welcome_channel_id, welcome_msg, welcome_img, welcome_enabled FROM server_configs WHERE guild_id = ?", (member.guild.id,))
-    if row and row[3] == 1 and row[0]:
-        channel = member.guild.get_channel(row[0])
-        if channel:
-            msg_text = row[1] or "ยินดีต้อนรับ {user} สู่ {server}!"
-            msg_text = msg_text.format(user=member.mention, username=member.name, server=member.guild.name, member_count=member.guild.member_count)
-            embed = discord.Embed(title="🎉 ยินดีต้อนรับสมาชิกใหม่!", description=msg_text, color=discord.Color.green())
-            if row[2]:
-                embed.set_image(url=row[2])
-            await channel.send(embed=embed)
-
-@client.event
-async def on_member_remove(member: discord.Member):
-    row = db_fetch_one("SELECT goodbye_channel_id, goodbye_msg, goodbye_img, goodbye_enabled FROM server_configs WHERE guild_id = ?", (member.guild.id,))
-    if row and row[3] == 1 and row[0]:
-        channel = member.guild.get_channel(row[0])
-        if channel:
-            msg_text = row[1] or "{username} ได้ออกจาก {server} แล้ว"
-            msg_text = msg_text.format(user=member.mention, username=member.name, server=member.guild.name, member_count=member.guild.member_count)
-            embed = discord.Embed(title="👋 สมาชิกออกจากเซิร์ฟเวอร์", description=msg_text, color=discord.Color.red())
-            if row[2]:
-                embed.set_image(url=row[2])
-            await channel.send(embed=embed)
-
-@client.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    # Detect Server Boost Event
-    if before.premium_since is None and after.premium_since is not None:
-        row = db_fetch_one("SELECT boost_channel_id, boost_msg, boost_img, boost_enabled FROM server_configs WHERE guild_id = ?", (after.guild.id,))
-        if row and row[3] == 1 and row[0]:
-            channel = after.guild.get_channel(row[0])
-            if channel:
-                msg_text = row[1] or "ขอบคุณ {user} ที่กด Boost ให้กับ {server}! 🚀"
-                msg_text = msg_text.format(user=after.mention, username=after.name, server=after.guild.name)
-                embed = discord.Embed(title="💎 มีการ Boost เซิร์ฟเวอร์!", description=msg_text, color=discord.Color.magenta())
-                if row[2]:
-                    embed.set_image(url=row[2])
-                await channel.send(embed=embed)
-
-# =========================================================
-# MAIN ENTRY POINT
-# =========================================================
+# ============================================================
+# START BOT
+# ============================================================
 
 if __name__ == "__main__":
-    keep_alive()
-    if TOKEN:
-        client.run(TOKEN)
-    else:
-        print("❌ [ERROR] ไม่พบ DISCORD_TOKEN ใน Environment Variables")
+
+    try:
+
+        bot.run(
+            DISCORD_TOKEN,
+            log_handler=None
+        )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Bot stopped by keyboard interrupt"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Fatal bot error: %s",
+            e
+        )
