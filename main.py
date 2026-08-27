@@ -89,7 +89,7 @@ async def ping(interaction: discord.Interaction):
     await interaction.followup.send(f"🏓 พิง! ความเร็วตอบสนอง: {latency} มิลลิวินาที")
 
 # --- หมวดเพลง (Music Commands) ---
-@client.tree.command(name="play", name_localizations={"th": "เล่นเพลง"}, description="สั่งเล่นเพลงหรือเพิ่มเข้าคิว (รองรับ YouTube, Spotify และชื่อเพลง)")
+@client.tree.command(name="play", name_localizations={"th": "เล่นเพลง"}, description="สั่งเล่นเพลงหรือเพิ่มเข้าคิว")
 @app_commands.describe(query="ใส่ชื่อเพลง หรือ ลิงก์ YouTube/Spotify")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
@@ -161,7 +161,7 @@ async def leave(interaction: discord.Interaction):
 
 # --- หมวดแอดมิน (Admin Commands) ---
 @client.tree.command(name="announce", name_localizations={"th": "ประกาศ"}, description="คำสั่งผู้ดูแลระบบ: ส่งข้อความประกาศ")
-@app_commands.describe(message="ข้อความที่ต้องการประกาศ", channel="เลือกช่องที่ต้องการส่งประกาศ (ถ้าไม่ระบุจะส่งช่องนี้)")
+@app_commands.describe(message="ข้อความที่ต้องการประกาศ", channel="เลือกช่องที่ต้องการส่งประกาศ")
 @app_commands.checks.has_permissions(administrator=True)
 async def announce(interaction: discord.Interaction, message: str, channel: discord.TextChannel = None):
     await interaction.response.defer(ephemeral=True)
