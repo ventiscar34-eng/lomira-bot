@@ -6,7 +6,7 @@ from threading import Thread
 import discord
 from discord import app_commands
 
-# ไลบรารีสำหรับ Spotify
+# 라이บรารีสำหรับ Spotify
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
@@ -82,7 +82,7 @@ async def on_ready():
 # ==========================================
 
 # --- หมวดทั่วไป & เช็กสถานะ ---
-@client.tree.command(name="ping", name_localizations={"th": "เช็กสถานะ"}, description="เช็กความเร็วการตอบสนองของบอท")
+@client.tree.command(name="ping", name_localizations={"th": "เช็คสถานะ"}, description="เช็กความเร็วการตอบสนองของบอท")
 async def ping(interaction: discord.Interaction):
     await interaction.response.defer()
     latency = round(client.latency * 1000)
