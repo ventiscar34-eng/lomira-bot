@@ -3,3 +3,4 @@ flask
 spotipy
 yt-dlp
 pynacl
+imageio-ffmpeg
