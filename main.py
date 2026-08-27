@@ -20,7 +20,6 @@ def home():
     return "LOMIRA Bot is Alive!"
 
 def run():
-    # ดึง Port จาก Render Environment หรือใช้ 8080 เป็น default
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -54,7 +53,6 @@ def get_query_from_input(query: str) -> str:
         return f"{track_name} {artist_name}"
     return query
 
-# ตัวเก็บคิวเพลงสำหรับแต่ละเซิร์ฟเวอร์
 song_queues = {}
 
 # ==========================================
@@ -63,6 +61,7 @@ song_queues = {}
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 class LomiraBot(discord.Client):
     def __init__(self):
@@ -96,6 +95,24 @@ async def ping(interaction: discord.Interaction):
 @app_commands.describe(query="ใส่ชื่อเพลง หรือ ลิงก์ YouTube/Spotify")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
+    
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("❌ คุณต้องเชื่อมต่อเข้าไปในห้องเสียง (Voice Channel) ก่อนใช้คำสั่งนี้ครับ!")
+        return
+
+    voice_channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    try:
+        if voice_client is None:
+            voice_client = await voice_channel.connect(self_deaf=True)
+        elif voice_client.channel != voice_channel:
+            await voice_client.move_to(voice_channel)
+            await interaction.guild.change_voice_state(channel=voice_channel, self_deaf=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ ไม่สามารถเชื่อมต่อห้องเสียงได้: {e}")
+        return
+
     guild_id = interaction.guild_id
     search_term = get_query_from_input(query)
     
@@ -105,7 +122,7 @@ async def play(interaction: discord.Interaction, query: str):
     song_queues[guild_id].append(search_term)
     
     if len(song_queues[guild_id]) == 1:
-        await interaction.followup.send(f"🎵 กำลังเล่นเพลง: **{search_term}**")
+        await interaction.followup.send(f"🎵 เข้าห้อง **{voice_channel.name}** เรียบร้อย! กำลังเล่นเพลง: **{search_term}** 🎧 (ตั้งค่าหูฟังสีแดงแล้ว)")
     else:
         await interaction.followup.send(f"🎶 เพิ่มลงคิวเรียบร้อย: **{search_term}** (คิวที่ {len(song_queues[guild_id])})")
 
@@ -173,6 +190,43 @@ async def announce(interaction: discord.Interaction, message: str, channel: disc
     embed.set_footer(text=f"ประกาศโดย {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
     await target_channel.send(embed=embed)
     await interaction.followup.send(f"✅ ส่งประกาศไปยังช่อง {target_channel.mention} เรียบร้อยแล้วครับ", ephemeral=True)
+
+@client.tree.command(name="createrole", description="คำสั่งผู้ดูแลระบบ: สร้างยศใหม่ในเซิร์ฟเวอร์")
+@app_commands.describe(
+    name="ชื่อยศที่ต้องการสร้าง",
+    color="รหัสสี Hex (เช่น #FF0000 หรือ red, blue, green)",
+    hoist="แสดงยศนี้แยกในรายการสมาชิกหรือไม่ (True/False)"
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+async def createrole(
+    interaction: discord.Interaction, 
+    name: str, 
+    color: str = None, 
+    hoist: bool = False
+):
+    await interaction.response.defer()
+    
+    role_color = discord.Color.default()
+    if color:
+        try:
+            if color.startswith("#"):
+                color_code = int(color.lstrip("#"), 16)
+                role_color = discord.Color(color_code)
+            elif hasattr(discord.Color, color.lower()):
+                role_color = getattr(discord.Color, color.lower())()
+        except Exception:
+            await interaction.followup.send("⚠️ รหัสสีไม่ถูกต้อง ระบบจะใช้สีเริ่มต้นให้แทนครับ")
+
+    try:
+        new_role = await interaction.guild.create_role(
+            name=name, 
+            color=role_color, 
+            hoist=hoist,
+            reason=f"สร้างโดย {interaction.user.name}"
+        )
+        await interaction.followup.send(f"✅ สร้างยศ {new_role.mention} เรียบร้อยแล้วครับ!")
+    except Exception as e:
+        await interaction.followup.send(f"❌ ไม่สามารถสร้างยศได้: {e}")
 
 @client.tree.command(name="addrole", description="คำสั่งผู้ดูแลระบบ: มอบยศให้สมาชิก")
 @app_commands.describe(member="เลือกสมาชิก", role="เลือกยศที่ต้องการมอบให้")
