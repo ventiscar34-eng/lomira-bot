@@ -1,7 +1,7 @@
-discord.py
-flask
-spotipy
+discord.py[voice]
+Flask
 yt-dlp
-pynacl
 imageio-ffmpeg
-py-dave
+spotipy
+PyNaCl
+davey
