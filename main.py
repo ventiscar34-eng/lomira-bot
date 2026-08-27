@@ -6,6 +6,7 @@ from threading import Thread
 import discord
 from discord import app_commands
 import yt_dlp
+import imageio_ffmpeg
 
 # ไลบรารีสำหรับ Spotify
 import spotipy
@@ -59,6 +60,9 @@ def get_query_from_input(query: str) -> str:
 
 # ตัวเก็บคิวเพลงแต่ละเซิร์ฟเวอร์
 song_queues = {}
+
+# ดึง Path ของ FFmpeg อัตโนมัติจาก imageio-ffmpeg
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ตั้งค่า yt-dlp และ ffmpeg
 YTDL_OPTIONS = {
@@ -120,7 +124,7 @@ def play_next(guild_id, interaction):
         song_info = song_queues[guild_id].pop(0)
         voice_client = interaction.guild.voice_client
         if voice_client and voice_client.is_connected():
-            source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
+            source = discord.FFmpegPCMAudio(song_info['url'], executable=ffmpeg_path, **FFMPEG_OPTIONS)
             voice_client.play(source, after=lambda e: play_next(guild_id, interaction))
             
             # ส่งข้อความบอกเพลงถัดไป
@@ -189,7 +193,7 @@ async def play(interaction: discord.Interaction, query: str):
 
     # ถ้าบอทไม่ได้เล่นเพลงอยู่ ให้เล่นทันที
     if not voice_client.is_playing() and not voice_client.is_paused():
-        source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
+        source = discord.FFmpegPCMAudio(song_info['url'], executable=ffmpeg_path, **FFMPEG_OPTIONS)
         voice_client.play(source, after=lambda e: play_next(guild_id, interaction))
         await interaction.followup.send(
             f"➕ | **เพิ่มเพลง:** {song_info['title']}\n"
