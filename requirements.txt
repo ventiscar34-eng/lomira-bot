@@ -4,3 +4,4 @@ spotipy
 yt-dlp
 pynacl
 imageio-ffmpeg
+py-dave
