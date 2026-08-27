@@ -5,6 +5,7 @@ from flask import Flask
 from threading import Thread
 import discord
 from discord import app_commands
+import yt_dlp
 
 # ไลบรารีสำหรับ Spotify
 import spotipy
@@ -29,7 +30,7 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 2. ตั้งค่า Spotify API & ระบบจัดการคิวเพลง
+# 2. ตั้งค่า Spotify API & ระบบค้นหาเพลง
 # ==========================================
 SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
@@ -47,13 +48,47 @@ def get_query_from_input(query: str) -> str:
     
     if match and sp:
         track_id = match.group(1)
-        track_info = sp.track(track_id)
-        track_name = track_info['name']
-        artist_name = track_info['artists'][0]['name']
-        return f"{track_name} {artist_name}"
+        try:
+            track_info = sp.track(track_id)
+            track_name = track_info['name']
+            artist_name = track_info['artists'][0]['name']
+            return f"{track_name} {artist_name}"
+        except Exception:
+            pass
     return query
 
+# ตัวเก็บคิวเพลงแต่ละเซิร์ฟเวอร์
 song_queues = {}
+
+# ตั้งค่า yt-dlp และ ffmpeg
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'extractaudio': True,
+    'audioformat': 'mp3',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+}
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+
+def format_duration(seconds):
+    if not seconds:
+        return "ไม่ทราบเวลา"
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}:{secs:02d}"
 
 # ==========================================
 # 3. ตั้งค่า Discord Bot Client
@@ -79,18 +114,33 @@ client = LomiraBot()
 async def on_ready():
     print(f"[LOMIRA] Online as {client.user}")
 
+# ฟังก์ชันสำหรับเล่นเพลงในคิวต่อไป
+def play_next(guild_id, interaction):
+    if guild_id in song_queues and len(song_queues[guild_id]) > 0:
+        song_info = song_queues[guild_id].pop(0)
+        voice_client = interaction.guild.voice_client
+        if voice_client and voice_client.is_connected():
+            source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
+            voice_client.play(source, after=lambda e: play_next(guild_id, interaction))
+            
+            # ส่งข้อความบอกเพลงถัดไป
+            asyncio.run_coroutine_threadsafe(
+                interaction.channel.send(f"🎵 กำลังเล่น: **{song_info['title']}**\nความยาว: {song_info['duration']}"),
+                client.loop
+            )
+
 # ==========================================
 # 4. คำสั่ง Slash Commands
 # ==========================================
 
-# --- หมวดทั่วไป & เช็กสถานะ ---
+# --- หมวดทั่วไป ---
 @client.tree.command(name="ping", description="เช็กความเร็วการตอบสนองของบอท")
 async def ping(interaction: discord.Interaction):
     await interaction.response.defer()
     latency = round(client.latency * 1000)
     await interaction.followup.send(f"🏓 พิง! ความเร็วตอบสนอง: {latency} มิลลิวินาที")
 
-# --- หมวดเพลง (Music Commands) ---
+# --- หมวดเพลง ---
 @client.tree.command(name="play", description="สั่งเล่นเพลงหรือเพิ่มเข้าคิว")
 @app_commands.describe(query="ใส่ชื่อเพลง หรือ ลิงก์ YouTube/Spotify")
 async def play(interaction: discord.Interaction, query: str):
@@ -103,6 +153,7 @@ async def play(interaction: discord.Interaction, query: str):
     voice_channel = interaction.user.voice.channel
     voice_client = interaction.guild.voice_client
 
+    # เชื่อมต่อเข้าห้องเสียงพร้อมเปิดโหมด Deafen (หูฟังสีแดง)
     try:
         if voice_client is None:
             voice_client = await voice_channel.connect(self_deaf=True)
@@ -113,33 +164,55 @@ async def play(interaction: discord.Interaction, query: str):
         await interaction.followup.send(f"❌ ไม่สามารถเชื่อมต่อห้องเสียงได้: {e}")
         return
 
-    guild_id = interaction.guild_id
+    # ดึงข้อมูลเพลง
     search_term = get_query_from_input(query)
-    
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(f"ytsearch:{search_term}", download=False))
+        if 'entries' in data and len(data['entries']) > 0:
+            info = data['entries'][0]
+        else:
+            info = data
+    except Exception as e:
+        await interaction.followup.send("❌ ไม่พบข้อมูลเพลง หรือเกิดข้อผิดพลาดในการดึงเพลง")
+        return
+
+    song_info = {
+        'title': info.get('title', 'Unknown Title'),
+        'url': info.get('url'),
+        'duration': format_duration(info.get('duration'))
+    }
+
+    guild_id = interaction.guild_id
     if guild_id not in song_queues:
         song_queues[guild_id] = []
-        
-    song_queues[guild_id].append(search_term)
-    
-    if len(song_queues[guild_id]) == 1:
-        await interaction.followup.send(f"🎵 เข้าห้อง **{voice_channel.name}** เรียบร้อย! กำลังเล่นเพลง: **{search_term}** 🎧 (ตั้งค่าหูฟังสีแดงแล้ว)")
+
+    # ถ้าบอทไม่ได้เล่นเพลงอยู่ ให้เล่นทันที
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        source = discord.FFmpegPCMAudio(song_info['url'], **FFMPEG_OPTIONS)
+        voice_client.play(source, after=lambda e: play_next(guild_id, interaction))
+        await interaction.followup.send(
+            f"➕ | **เพิ่มเพลง:** {song_info['title']}\n"
+            f"กำลังเล่น **{song_info['title']}**\n"
+            f"ความยาว: {song_info['duration']}"
+        )
     else:
-        await interaction.followup.send(f"🎶 เพิ่มลงคิวเรียบร้อย: **{search_term}** (คิวที่ {len(song_queues[guild_id])})")
+        song_queues[guild_id].append(song_info)
+        await interaction.followup.send(
+            f"🎶 เพิ่มลงคิวเรียบร้อย: **{song_info['title']}** (คิวที่ {len(song_queues[guild_id])})\n"
+            f"ความยาว: {song_info['duration']}"
+        )
 
 @client.tree.command(name="skip", description="ข้ามเพลงปัจจุบันไปเพลงถัดไป")
 async def skip(interaction: discord.Interaction):
     await interaction.response.defer()
-    guild_id = interaction.guild_id
+    voice_client = interaction.guild.voice_client
     
-    if guild_id in song_queues and len(song_queues[guild_id]) > 0:
-        skipped = song_queues[guild_id].pop(0)
-        if len(song_queues[guild_id]) > 0:
-            next_song = song_queues[guild_id][0]
-            await interaction.followup.send(f"⏭️ ข้ามเพลง **{skipped}** แล้ว -> กำลังเล่นเพลงถัดไป: **{next_song}**")
-        else:
-            await interaction.followup.send(f"⏭️ ข้ามเพลง **{skipped}** แล้ว (ไม่มีเพลงในคิวต่อ)")
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await interaction.followup.send("⏭️ ข้ามเพลงเรียบร้อยแล้ว!")
     else:
-        await interaction.followup.send("❌ ไม่มีเพลงในคิวให้ข้ามครับ")
+        await interaction.followup.send("❌ ไม่มีเพลงที่กำลังเล่นอยู่ครับ")
 
 @client.tree.command(name="queue", description="ดูรายการเพลงทั้งหมดในคิว")
 async def queue(interaction: discord.Interaction):
@@ -149,7 +222,7 @@ async def queue(interaction: discord.Interaction):
     if guild_id in song_queues and len(song_queues[guild_id]) > 0:
         msg = "**📋 รายการคิวเพลงปัจจุบัน:**\n"
         for i, song in enumerate(song_queues[guild_id], 1):
-            msg += f"{i}. {song}\n"
+            msg += f"{i}. {song['title']} ({song['duration']})\n"
         await interaction.followup.send(msg)
     else:
         await interaction.followup.send("📭 ตอนนี้ไม่มีเพลงอยู่ในคิวครับ")
@@ -163,8 +236,11 @@ async def stop(interaction: discord.Interaction):
         song_queues[guild_id].clear()
         
     voice_client = interaction.guild.voice_client
-    if voice_client and voice_client.is_connected():
-        await voice_client.disconnect()
+    if voice_client:
+        if voice_client.is_playing():
+            voice_client.stop()
+        if voice_client.is_connected():
+            await voice_client.disconnect()
         await interaction.followup.send("⏹️ หยุดเล่นเพลง ล้างคิวทั้งหมด และออกจากห้องเสียงเรียบร้อยครับ")
     else:
         await interaction.followup.send("⏹️ หยุดเล่นเพลงและล้างคิวเรียบร้อยครับ")
@@ -179,7 +255,7 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.followup.send("❌ บอทไม่ได้อยู่ในห้องเสียงครับ")
 
-# --- หมวดแอดมิน (Admin Commands) ---
+# --- หมวดแอดมิน ---
 @client.tree.command(name="announce", description="คำสั่งผู้ดูแลระบบ: ส่งข้อความประกาศ")
 @app_commands.describe(message="ข้อความที่ต้องการประกาศ", channel="เลือกช่องที่ต้องการส่งประกาศ")
 @app_commands.checks.has_permissions(administrator=True)
@@ -283,7 +359,6 @@ async def purge(interaction: discord.Interaction, amount: int):
     deleted = await interaction.channel.purge(limit=amount)
     await interaction.followup.send(f"🧹 ลบข้อความเรียบร้อยแล้วจำนวน {len(deleted)} ข้อความ", ephemeral=True)
 
-# จัดการข้อผิดพลาดเรื่องสิทธิ์ Admin
 @client.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
